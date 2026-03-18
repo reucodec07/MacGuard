@@ -1,0 +1,47 @@
+{
+  "": {
+    "swift-dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/master.swiftdeps"
+  },
+  "/Users/reucodec/Desktop/MacGuard/Sources/MacGuard/AppUninstaller.swift": {
+    "dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/AppUninstaller.d",
+    "object": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/AppUninstaller.swift.o",
+    "swiftmodule": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/AppUninstaller~partial.swiftmodule",
+    "swift-dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/AppUninstaller.swiftdeps",
+    "diagnostics": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/AppUninstaller.dia"
+  },
+  "/Users/reucodec/Desktop/MacGuard/Sources/MacGuard/ContentView.swift": {
+    "dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ContentView.d",
+    "object": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ContentView.swift.o",
+    "swiftmodule": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ContentView~partial.swiftmodule",
+    "swift-dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ContentView.swiftdeps",
+    "diagnostics": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ContentView.dia"
+  },
+  "/Users/reucodec/Desktop/MacGuard/Sources/MacGuard/ProcessMonitor.swift": {
+    "dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitor.d",
+    "object": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitor.swift.o",
+    "swiftmodule": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitor~partial.swiftmodule",
+    "swift-dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitor.swiftdeps",
+    "diagnostics": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitor.dia"
+  },
+  "/Users/reucodec/Desktop/MacGuard/Sources/MacGuard/ProcessMonitorView.swift": {
+    "dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitorView.d",
+    "object": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitorView.swift.o",
+    "swiftmodule": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitorView~partial.swiftmodule",
+    "swift-dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitorView.swiftdeps",
+    "diagnostics": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/ProcessMonitorView.dia"
+  },
+  "/Users/reucodec/Desktop/MacGuard/Sources/MacGuard/UninstallerView.swift": {
+    "dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/UninstallerView.d",
+    "object": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/UninstallerView.swift.o",
+    "swiftmodule": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/UninstallerView~partial.swiftmodule",
+    "swift-dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/UninstallerView.swiftdeps",
+    "diagnostics": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/UninstallerView.dia"
+  },
+  "/Users/reucodec/Desktop/MacGuard/Sources/MacGuard/main.swift": {
+    "dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/main.d",
+    "object": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/main.swift.o",
+    "swiftmodule": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/main~partial.swiftmodule",
+    "swift-dependencies": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/main.swiftdeps",
+    "diagnostics": "/Users/reucodec/Desktop/MacGuard/.build/arm64-apple-macosx/debug/MacGuard.build/main.dia"
+  }
+}
