@@ -1,0 +1,72 @@
+# ── Swift Package Manager ────────────────────────────────────
+.build/
+.swiftpm/
+*.resolved
+
+# Uncomment if you want to lock dependencies (recommended for apps):
+# !Package.resolved
+
+# ── Xcode (if you ever open this in Xcode) ───────────────────
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+*.xccheckout
+*.moved-aside
+*.xcuserstate
+*.xcscmblueprint
+
+# ── macOS filesystem metadata ────────────────────────────────
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+.VolumeIcon.icns
+*.icloud
+
+# ── Dropbox ──────────────────────────────────────────────────
+# Dropbox conflict copies — created when two machines edit simultaneously
+*\ (conflicted\ copy\ *).swift
+*\ (conflicted\ copy\ *).md
+.dropbox
+.dropbox.cache
+Icon\r
+
+# ── Build artefacts & signing ────────────────────────────────
+*.o
+*.d
+*.dia
+*.a
+*.dylib
+MacGuard.app/
+*.ipa
+*.dSYM/
+*.dSYM.zip
+entitlements.plist
+
+# ── Code signing & distribution ──────────────────────────────
+*.p12
+*.cer
+*.mobileprovision
+*.provisionprofile
+ExportOptions.plist
+
+# ── Secrets & environment ────────────────────────────────────
+.env
+.env.local
+*.pem
+*.key
+Secrets.swift
+APIKeys.swift
+
+# ── Editor & OS noise ────────────────────────────────────────
+.vscode/
+.cursor/
+*.swp
+*.swo
+*~
+\#*\#
+.idea/
+*.iml
