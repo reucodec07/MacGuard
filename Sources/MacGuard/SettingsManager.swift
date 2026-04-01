@@ -30,6 +30,11 @@ class SettingsManager: ObservableObject {
         didSet { defaults.set(sortMode.rawValue, forKey: "sortMode") }
     }
 
+    // AI
+    @Published var anthropicApiKey: String {
+        didSet { defaults.set(anthropicApiKey, forKey: "anthropicApiKey") }
+    }
+
     private init() {
         autoKillEnabled    = defaults.bool(forKey: "autoKillEnabled")
         autoKillThreshold  = defaults.object(forKey: "autoKillThreshold")  as? Double ?? 80.0
@@ -38,5 +43,6 @@ class SettingsManager: ObservableObject {
         ramAlertThreshold  = defaults.object(forKey: "ramAlertThreshold")  as? Double ?? 500.0
         let raw            = defaults.string(forKey: "sortMode") ?? SortMode.cpu.rawValue
         sortMode           = SortMode(rawValue: raw) ?? .cpu
+        anthropicApiKey    = defaults.string(forKey: "anthropicApiKey") ?? ""
     }
 }

@@ -29,17 +29,15 @@ struct SparklineView: View {
                             path.move(to: CGPoint(x: 0, y: h))
                             for (i, val) in pts.enumerated() {
                                 let x = CGFloat(i) * step
-                                let y = h - CGFloat(val) * h
-                                i == 0
-                                    ? path.addLine(to: CGPoint(x: x, y: y))
-                                    : path.addLine(to: CGPoint(x: x, y: y))
+                                let y = h - (CGFloat(val) * (h - 4) + 2)
+                                path.addLine(to: CGPoint(x: x, y: y))
                             }
                             path.addLine(to: CGPoint(x: w, y: h))
                             path.closeSubpath()
                         }
                         .fill(
                             LinearGradient(
-                                colors: [color.opacity(0.25), color.opacity(0.03)],
+                                colors: [color.opacity(0.3), color.opacity(0.01)],
                                 startPoint: .top, endPoint: .bottom
                             )
                         )
@@ -49,7 +47,7 @@ struct SparklineView: View {
                     Path { path in
                         for (i, val) in pts.enumerated() {
                             let x = CGFloat(i) * step
-                            let y = h - CGFloat(val) * h
+                            let y = h - (CGFloat(val) * (h - 4) + 2)
                             i == 0
                                 ? path.move(to: CGPoint(x: x, y: y))
                                 : path.addLine(to: CGPoint(x: x, y: y))
@@ -58,25 +56,29 @@ struct SparklineView: View {
                     .stroke(color, style: StrokeStyle(lineWidth: lineWidth,
                                                       lineCap: .round,
                                                       lineJoin: .round))
+                    .shadow(color: color.opacity(0.3), radius: 2, x: 0, y: 1)
 
                     // ── Latest value dot ──────────────────────
                     if let last = pts.last {
                         Circle()
-                            .fill(color)
-                            .frame(width: 4, height: 4)
-                            .position(x: w, y: h - CGFloat(last) * h)
+                            .fill(Color.white)
+                            .frame(width: 5, height: 5)
+                            .shadow(color: .black.opacity(0.2), radius: 1)
+                            .overlay(Circle().stroke(color, lineWidth: 1.5))
+                            .position(x: w, y: h - (CGFloat(last) * (h - 4) + 2))
                     }
                 }
-                .clipShape(RoundedRectangle(cornerRadius: 3))
-
             } else {
-                // Not enough data yet — show placeholder
-                RoundedRectangle(cornerRadius: 3)
-                    .fill(Color.secondary.opacity(0.08))
+                // Not enough data yet — show premium placeholder
+                RoundedRectangle(cornerRadius: 6)
+                    .fill(Color.primary.opacity(0.03))
                     .overlay(
-                        Text("collecting…")
-                            .font(.system(size: 7))
-                            .foregroundColor(.secondary)
+                        HStack(spacing: 4) {
+                            ProgressView().controlSize(.small).scaleEffect(0.5)
+                            Text("Collecting...")
+                                .font(.system(size: 8, weight: .medium))
+                                .foregroundColor(.secondary)
+                        }
                     )
             }
         }

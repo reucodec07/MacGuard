@@ -6,32 +6,44 @@ struct SettingsView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 24) {
                 Text("Settings")
-                    .font(.system(size: 22, weight: .bold))
+                    .font(.system(size: 28, weight: .bold))
+                    .padding(.bottom, 8)
 
-                notificationsSection
-                Divider()
-                autoKillSection
-                launchAtLoginSection
+                SectionCard(title: "Alerts", icon: "bell.badge.fill") {
+                    notificationsSection
+                }
+                
+                SectionCard(title: "Auto-Kill", icon: "bolt.fill") {
+                    autoKillSection
+                }
+                
+                SectionCard(title: "Startup", icon: "power") {
+                    launchAtLoginSection
+                }
+                
+                SectionCard(title: "AI Insights", icon: "sparkles") {
+                    aiInsightsSection
+                }
             }
-            .padding(20)
+            .padding(24)
         }
-        .frame(width: 450, height: 420)
+        .background(Color(NSColor.windowBackgroundColor))
+        .frame(minWidth: 500, maxWidth: .infinity, minHeight: 600, maxHeight: .infinity)
     }
 
     private var autoKillSection: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Auto-Kill")
-                .font(.headline)
-
+        VStack(alignment: .leading, spacing: 16) {
             HStack(alignment: .top) {
                 Toggle("", isOn: $settings.autoKillEnabled)
                     .labelsHidden()
                     .toggleStyle(.switch)
+                    .controlSize(.small)
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Automatically kill processes exceeding CPU threshold")
+                        .font(.system(size: 13, weight: .medium))
                     Text("MacGuard will send SIGTERM to any process that exceeds the threshold below.")
                         .font(.caption)
                         .foregroundColor(.secondary)
@@ -39,37 +51,35 @@ struct SettingsView: View {
             }
 
             if settings.autoKillEnabled {
-                HStack {
-                    Text("CPU threshold:")
-                        .frame(width: 120, alignment: .leading)
+                VStack(spacing: 12) {
+                    HStack {
+                        Text("CPU threshold")
+                            .font(.system(size: 12))
+                        Spacer()
+                        Text("\(Int(settings.autoKillThreshold))%")
+                            .font(.system(size: 12, weight: .bold).monospacedDigit())
+                            .foregroundColor(.red)
+                    }
                     Slider(value: $settings.autoKillThreshold, in: 10...100, step: 5)
                         .tint(.red)
-                    Text("\(Int(settings.autoKillThreshold))%")
-                        .frame(width: 45, alignment: .trailing)
-                        .monospacedDigit()
-                        .foregroundColor(.red)
                 }
+                .padding(12)
+                .background(Color.primary.opacity(0.04))
+                .cornerRadius(8)
 
-                HStack(spacing: 6) {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundColor(.orange)
-                        .font(.system(size: 11))
-                    Text("This forcibly terminates processes without saving their state. Use with caution.")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .padding(8)
-                .background(Color.orange.opacity(0.08))
-                .cornerRadius(6)
+                BannerView(
+                    title: "Force Termination",
+                    subtitle: "This terminates processes without saving. Use with caution.",
+                    style: .warning,
+                    actionLabel: nil,
+                    action: nil
+                )
             }
         }
     }
 
     private var notificationsSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Alerts")
-                .font(.headline)
-
+        VStack(alignment: .leading, spacing: 16) {
             Toggle("Enable CPU and RAM alerts", isOn: Binding(
                 get: { settings.notificationsEnabled },
                 set: { enabled in
@@ -80,9 +90,10 @@ struct SettingsView: View {
                     }
                 }
             ))
+            .font(.system(size: 13, weight: .medium))
 
             if settings.notificationsEnabled {
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 16) {
                     sliderRow(
                         title: "CPU Alert Threshold",
                         valueText: "\(Int(settings.cpuAlertThreshold))%"
@@ -97,24 +108,84 @@ struct SettingsView: View {
                         Slider(value: $settings.ramAlertThreshold, in: 100...2000, step: 100)
                     }
                 }
-                .transition(.opacity)
+                .transition(.opacity.combined(with: .move(edge: .top)))
             }
         }
     }
 
     private var launchAtLoginSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Startup")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 16) {
+            if loginItem.status == .requiresApproval {
+                BannerView(
+                    title: "Action Required",
+                    subtitle: "Allow MacGuard to run at login in System Settings.",
+                    style: .critical,
+                    actionLabel: "Open Settings",
+                    action: {
+                        Task { await loginItem.toggle() }
+                    }
+                )
+                .padding(.bottom, 4)
+            }
+            
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Launch MacGuard at Login")
+                        .font(.system(size: 13, weight: .medium))
+                    Text(loginItem.statusLabel)
+                        .font(.caption)
+                        .foregroundColor(loginItem.statusColor)
+                }
+                
+                Spacer()
+                
+                if loginItem.isBusy {
+                    ProgressView().controlSize(.small).padding(.trailing, 8)
+                }
+                
+                Button(action: {
+                    Task { await loginItem.toggle() }
+                }) {
+                    Text(loginItem.actionLabel)
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.small)
+                .tint(loginItem.buttonTintColor)
+                .disabled(!loginItem.canToggle)
+            }
+            
+            if !loginItem.statusHelp.isEmpty {
+                Text(loginItem.statusHelp)
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                    .padding(.horizontal, 4)
+            }
+        }
+    }
 
-            Toggle("Launch at Login", isOn: Binding(
-                get: { loginItem.isEnabled },
-                set: { _ in loginItem.toggle() }
-            ))
-
-            Text(loginItem.statusLabel)
-                .font(.footnote)
-                .foregroundColor(.secondary)
+    private var aiInsightsSection: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Anthropic API Key")
+                    .font(.system(size: 13, weight: .medium))
+                
+                SecureField("sk-ant-...", text: $settings.anthropicApiKey)
+                    .textFieldStyle(.roundedBorder)
+                    .controlSize(.large)
+            }
+            
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "info.circle")
+                    .foregroundColor(.blue)
+                Text("Your API key is stored locally in your keychain and is only used to communicate with Anthropic's Claude API for file analysis.")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
+            
+            Link(destination: URL(string: "https://console.anthropic.com/")!) {
+                Label("Get API Key", systemImage: "arrow.up.right.square")
+                    .font(.system(size: 12, weight: .bold))
+            }
         }
     }
 
@@ -123,15 +194,45 @@ struct SettingsView: View {
         valueText: String,
         @ViewBuilder content: () -> Content
     ) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(title)
+                    .font(.system(size: 12))
                 Spacer()
                 Text(valueText)
-                    .foregroundColor(.secondary)
-                    .monospacedDigit()
+                    .font(.system(size: 12, weight: .bold).monospacedDigit())
+                    .foregroundColor(.accentColor)
             }
             content()
         }
+        .padding(12)
+        .background(Color.primary.opacity(0.04))
+        .cornerRadius(8)
+    }
+}
+
+struct SectionCard<Content: View>: View {
+    let title: String
+    let icon: String
+    let content: () -> Content
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack(spacing: 8) {
+                Image(systemName: icon)
+                    .foregroundColor(.accentColor)
+                Text(title)
+                    .font(.headline)
+            }
+            
+            content()
+        }
+        .padding(20)
+        .background(.regularMaterial)
+        .cornerRadius(16)
+        .overlay(
+            RoundedRectangle(cornerRadius: 16)
+                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+        )
     }
 }

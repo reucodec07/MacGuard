@@ -6,6 +6,7 @@ struct AppProcess: Identifiable, Equatable {
     var id: Int32 { pid }
     let name: String
     let cpuPercent: Double
+    let rawCPU: Double
     let memoryMB: Double
     let threads: Int
     let user: String
@@ -26,6 +27,17 @@ class ProcessMonitor: ObservableObject {
     @Published var ramSnapshots: [Int32: [Double]] = [:]
     @Published var isRunning     = false
     @Published var isFetching    = false   // true only while a ps poll is in flight
+
+    private var consecutiveHighCPU: [Int32: Int] = [:]
+    private var lastSamples: [Int32: (time: Double, timestamp: Date)] = [:]
+    private var lastSmoothedCPU: [Int32: Double] = [:]
+    private let protectedProcesses: Set<String> = [
+        "kernel_task", "WindowServer", "launchd", "Finder", "Dock",
+        "SystemUIServer", "loginwindow", "coreaudiod", "mds",
+        "MacGuard", "Terminal", "iTerm2", "Xcode", "Visual Studio Code",
+        "Code", "docker", "rustc", "go", "ffmpeg", "xcodebuild",
+        "swift-frontend", "node", "python3", "ruby"
+    ]
 
     private let historyLength    = 20
     private var timer: Timer?
@@ -91,7 +103,7 @@ class ProcessMonitor: ObservableObject {
             // available from plain `ps` without elevated privileges.
             let task = Process()
             task.executableURL  = URL(fileURLWithPath: "/bin/ps")
-            task.arguments      = ["-axo", "pid=,pcpu=,rss=,wq=,user=,comm="]
+            task.arguments      = ["-axo", "pid=,time=,rss=,wq=,user=,comm="]
             let pipe            = Pipe()
             task.standardOutput = pipe
             task.standardError  = Pipe()
@@ -109,19 +121,39 @@ class ProcessMonitor: ObservableObject {
                 for line in output.components(separatedBy: "\n") {
                     let t = line.trimmingCharacters(in: .whitespaces)
                     guard !t.isEmpty else { continue }
-                    // fields: pid, pcpu, rss, wq, user, comm (comm may contain spaces)
+                    
+                    // fields: pid, time, rss, wq, user, comm (comm may contain spaces)
                     let parts = t.split(separator: " ", maxSplits: 5,
                                         omittingEmptySubsequences: true)
                     guard parts.count >= 6,
-                          let pid     = Int32(parts[0]),
-                          let cpu     = Double(parts[1]),
-                          let rss     = Double(parts[2]),
-                          let threads = Int(parts[3]) else { continue }
+                          let pid = Int32(parts[0]) else { continue }
+                          
+                    let rawTime = String(parts[1])
+                    let cpuTime = self.parseTime(rawTime)
+                    let rss     = Double(parts[2]) ?? 0
+                    let threads = Int(parts[3]) ?? 0
+                    let now     = Date()
+                    
+                    var smoothedCPU: Double = 0
+                    var rawCPU: Double = 0
+                    if let prev = self.lastSamples[pid] {
+                        let deltaCPU = cpuTime - prev.time
+                        let deltaWall = now.timeIntervalSince(prev.timestamp)
+                        if deltaWall > 0 {
+                            rawCPU = (deltaCPU / deltaWall) * 100.0
+                            let alpha  = 0.3
+                            let prevSmooth = self.lastSmoothedCPU[pid] ?? rawCPU
+                            smoothedCPU = (alpha * rawCPU) + ((1.0 - alpha) * prevSmooth)
+                            self.lastSmoothedCPU[pid] = smoothedCPU
+                        }
+                    }
+                    self.lastSamples[pid] = (time: cpuTime, timestamp: now)
 
                     result.append(AppProcess(
                         pid:        pid,
                         name:       URL(fileURLWithPath: String(parts[5])).lastPathComponent,
-                        cpuPercent: cpu,
+                        cpuPercent: smoothedCPU,
+                        rawCPU:     rawCPU,
                         memoryMB:   rss / 1024.0,
                         threads:    threads,
                         user:       String(parts[4])
@@ -142,6 +174,8 @@ class ProcessMonitor: ObservableObject {
                 var ramSnap = self.ramSnapshots
                 cpuSnap = cpuSnap.filter { activePIDs.contains($0.key) }
                 ramSnap = ramSnap.filter { activePIDs.contains($0.key) }
+                self.lastSamples = self.lastSamples.filter { activePIDs.contains($0.key) }
+                self.lastSmoothedCPU = self.lastSmoothedCPU.filter { activePIDs.contains($0.key) }
 
                 for p in result {
                     var c = cpuSnap[p.pid] ?? []
@@ -161,15 +195,29 @@ class ProcessMonitor: ObservableObject {
                     self.cpuSnapshots  = cpuSnap
                     self.ramSnapshots  = ramSnap
                     self.isFetching    = false
+                    self.consecutiveHighCPU = self.consecutiveHighCPU.filter { activePIDs.contains($0.key) }
 
                     let s = SettingsManager.shared
                     if s.notificationsEnabled {
                         for p in sorted.prefix(10) { NotificationManager.shared.checkProcess(p) }
                     }
                     if s.autoKillEnabled {
-                        for p in sorted where p.cpuPercent > s.autoKillThreshold {
-                            Darwin.kill(p.pid, SIGTERM)
+                        for p in sorted {
+                            if p.rawCPU > s.autoKillThreshold {
+                                self.consecutiveHighCPU[p.pid, default: 0] += 1
+                                if self.consecutiveHighCPU[p.pid]! >= 3 {
+                                    if p.pid > 100 && !self.protectedProcesses.contains(p.name) && p.user == NSUserName() {
+                                        Darwin.kill(p.pid, SIGKILL)
+                                        NotificationManager.shared.notifyAutoKill(processName: p.name, cpu: p.rawCPU)
+                                    }
+                                    self.consecutiveHighCPU[p.pid] = 0
+                                }
+                            } else {
+                                self.consecutiveHighCPU.removeValue(forKey: p.pid)
+                            }
                         }
+                    } else {
+                        self.consecutiveHighCPU.removeAll()
                     }
                 }
             } catch {
@@ -191,5 +239,35 @@ class ProcessMonitor: ObservableObject {
     func forceKillProcess(_ p: AppProcess) {
         Darwin.kill(p.pid, SIGKILL)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) { [weak self] in self?.refresh() }
+    }
+
+    private func parseTime(_ timeString: String) -> Double {
+        let parts = timeString.components(separatedBy: ":")
+        var total: Double = 0
+        
+        if parts.count == 3 {
+            // [hh]:mm:ss.ss
+            let hours   = Double(parts[0]) ?? 0
+            let minutes = Double(parts[1]) ?? 0
+            let seconds = Double(parts[2]) ?? 0
+            total = (hours * 3600) + (minutes * 60) + seconds
+        } else if parts.count == 2 {
+            // mm:ss.ss
+            let minutes = Double(parts[0]) ?? 0
+            let seconds = Double(parts[1]) ?? 0
+            total = (minutes * 60) + seconds
+        } else {
+            total = Double(timeString) ?? 0
+        }
+        
+        // Handle [dd-]hh:mm:ss if needed? ps on macOS uses days for long-running
+        if timeString.contains("-") {
+            let dayParts = timeString.components(separatedBy: "-")
+            if let days = Double(dayParts[0]), let rest = dayParts.last {
+                total = (days * 86400) + parseTime(rest)
+            }
+        }
+        
+        return total
     }
 }

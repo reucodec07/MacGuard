@@ -1,110 +1,95 @@
-import AppKit
 import SwiftUI
+import AppKit
 
 class AppDelegate: NSObject, NSApplicationDelegate {
-    var window: NSWindow?
-    var settingsWindow: NSWindow?
-    var menuBarController: MenuBarController?
+    private var menuBarController: MenuBarController?
+    private var mainWindow: NSWindow?
+    private var settingsWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        setupMenu()
+        // Set activation policy correctly for Phase 13 behavior
+        NSApp.setActivationPolicy(.accessory)
+        
         menuBarController = MenuBarController()
-
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(openMainWindow),
-            name: .openMacGuardWindow,
-            object: nil
-        )
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(openSettingsWindow),
-            name: .openSettingsWindow,
-            object: nil
-        )
-    }
-
-    func setupMenu() {
-        let mainMenu = NSMenu()
-        let appItem = NSMenuItem()
-        mainMenu.addItem(appItem)
-        let appMenu = NSMenu()
-        appItem.submenu = appMenu
-        appMenu.addItem(NSMenuItem(
-            title: "Open MacGuard",
-            action: #selector(openMainWindow),
-            keyEquivalent: "o"))
-        appMenu.addItem(NSMenuItem(title: "Settings...", action: #selector(openSettingsWindow), keyEquivalent: ","))
-        appMenu.addItem(NSMenuItem.separator())
-        appMenu.addItem(NSMenuItem(
-            title: "Quit MacGuard",
-            action: #selector(NSApplication.terminate(_:)),
-            keyEquivalent: "q"))
-        NSApplication.shared.mainMenu = mainMenu
-    }
-    @objc func openSettingsWindow() {
-        if settingsWindow == nil {
-            settingsWindow = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 450, height: 350),
-                styleMask: [.titled, .closable],
-                backing: .buffered,
-                defer: false
-            )
-            settingsWindow?.isReleasedWhenClosed = false // <-- FIX: Prevents AppKit from over-releasing the window
-            settingsWindow?.title = "MacGuard Settings"
-            settingsWindow?.contentView = NSHostingView(rootView: SettingsView())
-            settingsWindow?.center()
-            NotificationCenter.default.addObserver(
-                forName: NSWindow.willCloseNotification,
-                object: settingsWindow,
-                queue: .main
-            ) { [weak self] _ in
-                self?.settingsWindow = nil
-                if self?.window == nil {
-                    NSApp.setActivationPolicy(.accessory)
-                }
-            }
+        ProcessMonitor.shared.start()
+        
+        NotificationCenter.default.addObserver(forName: .openMacGuardWindow, object: nil, queue: .main) { [weak self] _ in
+            self?.showMainWindow()
         }
-        settingsWindow?.makeKeyAndOrderFront(nil)
+        
+        NotificationCenter.default.addObserver(forName: .openSettingsWindow, object: nil, queue: .main) { [weak self] _ in
+            self?.showSettingsWindow()
+        }
+        
+        // Show the main window on first launch so the user knows it's working
+        showMainWindow()
+    }
+    
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        if !flag { showMainWindow() }
+        return true
+    }
+
+    func showMainWindow() {
+        if let window = mainWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+
+        let contentView = ContentView()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 1000, height: 640),
+            styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false)
+        window.center()
+        window.title = "MacGuard"
+        window.contentView = NSHostingView(rootView: contentView)
+        window.isReleasedWhenClosed = false
+        window.identifier = NSUserInterfaceItemIdentifier("main")
+        
+        mainWindow = window
+        window.makeKeyAndOrderFront(nil)
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-
-
-    @objc func openMainWindow() {
-        if window == nil {
-            window = NSWindow(
-                contentRect: NSRect(x: 0, y: 0, width: 1050, height: 680),
-                styleMask: [.titled, .closable, .miniaturizable, .resizable],
-                backing: .buffered,
-                defer: false
-            )
-            window?.isReleasedWhenClosed = false // <-- FIX: Prevents AppKit from over-releasing the window
-            window?.title = "MacGuard"
-            window?.contentView = NSHostingView(rootView: ContentView())
+    func showSettingsWindow() {
+        if let window = settingsWindow {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.setActivationPolicy(.regular)
+            NSApp.activate(ignoringOtherApps: true)
+            return
         }
-        window?.center()
-        window?.makeKeyAndOrderFront(nil)
+
+        let settingsView = SettingsView()
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 520, height: 680),
+            styleMask: [.titled, .closable, .resizable, .fullSizeContentView],
+            backing: .buffered, defer: false)
+        window.center()
+        window.title = "MacGuard Settings"
+        window.contentView = NSHostingView(rootView: settingsView)
+        window.isReleasedWhenClosed = false
+        
+        settingsWindow = window
+        window.makeKeyAndOrderFront(nil)
         NSApp.setActivationPolicy(.regular)
         NSApp.activate(ignoringOtherApps: true)
-        // Return to accessory when window closes
-        NotificationCenter.default.addObserver(
-            forName: NSWindow.willCloseNotification,
-            object: window,
-            queue: .main
-        ) { [weak self] _ in
-            self?.window = nil
-            if self?.settingsWindow == nil { NSApp.setActivationPolicy(.accessory) }
-        }
     }
+}
 
-    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
-        return false
-    }
+extension Notification.Name {
+    static let openMacGuardWindow = Notification.Name("openMacGuardWindow")
+    static let openSettingsWindow = Notification.Name("openSettingsWindow")
+    static let refreshCurrentSection = Notification.Name("refreshCurrentSection")
+    static let focusSearchField = Notification.Name("focusSearchField")
 }
 
 let app = NSApplication.shared
 let delegate = AppDelegate()
 app.delegate = delegate
 app.run()
+
+

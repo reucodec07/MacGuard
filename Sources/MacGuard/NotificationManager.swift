@@ -66,6 +66,13 @@ class NotificationManager: ObservableObject {
                                     content: content, trigger: nil)) { _ in }
     }
 
+    func notifyAutoKill(processName: String, cpu: Double) {
+        fire(id: "autokill-\(processName)",
+             title: "🛑 Process Terminated",
+             body: "\(processName) was closed for using \(Int(cpu))% CPU consistently.",
+             subtitle: "MacGuard Auto-Kill")
+    }
+
     func clearAll() {
         guard let c = center else { return }
         c.removeAllDeliveredNotifications()

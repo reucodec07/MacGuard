@@ -2,37 +2,65 @@ import SwiftUI
 import AppKit
 
 struct DiskAnalyzerView: View {
+    @State private var searchText = ""
     @StateObject private var analyzer      = DiskAnalyzer()
     @StateObject private var cleanupEngine = CleanupEngine()
     @State private var showFilePicker      = false
     @State private var showCleanup         = false
     @State private var hoveredID:          UUID?
+    @State private var selectedItem:       DiskItem?
+    @State private var showInspector       = false
     @State private var shimmer             = false
 
     private let chartLimit = 12
 
-    // Show chart+list as soon as ANY items exist — even pending ones.
-    // Only show blank states when truly nothing has been scanned yet.
     var showContent: Bool { !analyzer.items.isEmpty }
 
     var body: some View {
-        VStack(spacing: 0) {
-            toolbar
-            Divider()
-            if analyzer.rootURL == nil {
-                emptyState
-            } else if !showContent && analyzer.isScanning {
-                // Only shown briefly before the first batch of items arrives
-                firstLoadState
-            } else if showContent {
-                HSplitView {
-                    chartPanel.frame(minWidth: 360, idealWidth: 420)
-                    listPanel.frame(minWidth: 320)
+        ZStack {
+            VStack(spacing: 0) {
+                toolbar
+                
+                ScrollView {
+                    VStack(spacing: 24) {
+                        if let root = analyzer.rootURL {
+                            volumeVaultHero(for: root)
+                        } else {
+                            welcomeHero
+                        }
+                        
+                        if showContent {
+                            HStack(alignment: .top, spacing: 20) {
+                                chartPanel
+                                    .frame(maxWidth: .infinity)
+                                listPanel
+                                    .frame(width: 380)
+                            }
+                        } else if analyzer.isScanning {
+                            scanningState
+                        } else {
+                            emptyState
+                        }
+                    }
+                    .padding(24)
                 }
-            } else {
-                emptyFolderState
+            }
+            .blur(radius: showInspector ? 2 : 0)
+            
+            InspectorPane(title: "Disk Item Details", isPresented: $showInspector) {
+                Group {
+                    if let item = selectedItem {
+                        DiskItemInspector(item: item) {
+                            analyzer.drillDown(into: item)
+                            showInspector = false
+                        }
+                    } else {
+                        Color.clear
+                    }
+                }
             }
         }
+        .background(Color(NSColor.windowBackgroundColor))
         .fileImporter(
             isPresented: $showFilePicker,
             allowedContentTypes: [.folder],
@@ -49,120 +77,89 @@ struct DiskAnalyzerView: View {
             }
         }
         .onAppear {
-            // Start shimmer pulse loop — drives the pending bar animation
             withAnimation(.easeInOut(duration: 0.85).repeatForever(autoreverses: true)) {
                 shimmer = true
             }
         }
     }
 
-    // MARK: — Toolbar
+    // MARK: - Toolbar
 
-    var toolbar: some View {
-        HStack(spacing: 10) {
+    private var toolbar: some View {
+        HStack(spacing: 16) {
             breadcrumbOrTitle
-
+            
             Spacer()
-
-            // Progress bar + status — shown while scanning
+            
             if analyzer.isScanning {
-                HStack(spacing: 8) {
-                    VStack(alignment: .trailing, spacing: 3) {
-                        ProgressView(value: analyzer.scanProgress)
-                            .frame(width: 140)
-                            .tint(.teal)
-                            .animation(.easeOut(duration: 0.25), value: analyzer.scanProgress)
-                        Text(analyzer.progress)
-                            .font(.system(size: 10))
-                            .foregroundColor(.secondary)
-                            .frame(width: 140, alignment: .trailing)
-                            .lineLimit(1)
-                    }
-                    Button("Cancel") { analyzer.cancel() }
-                        .buttonStyle(.bordered)
-                        .controlSize(.small)
+                VStack(alignment: .trailing, spacing: 4) {
+                    ProgressView(value: analyzer.scanProgress)
+                        .frame(width: 120)
+                        .tint(.teal)
+                    Text(analyzer.progress)
+                        .font(.system(size: 10))
+                        .foregroundColor(.secondary)
                 }
-            } else if !analyzer.progress.isEmpty {
-                Text(analyzer.progress)
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                
+                Button("Cancel") { analyzer.cancel() }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
             }
-
-            // Smart Cleanup button — only shown after a scan completes
+            
             if !analyzer.isScanning && !analyzer.items.isEmpty {
                 Button {
                     cleanupEngine.analyse(
                         rootURL:  analyzer.rootURL ?? FileManager.default.homeDirectoryForCurrentUser,
                         allItems: analyzer.items,
-                        apiKey:   "REDACTED"
+                        apiKey:   SettingsManager.shared.anthropicApiKey
                     )
                     showCleanup = true
                 } label: {
                     Label("Smart Cleanup", systemImage: "wand.and.sparkles")
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
                 .controlSize(.small)
                 .tint(.teal)
             }
 
-            // Choose folder
             Button {
                 showFilePicker = true
             } label: {
-                Label("Choose Folder", systemImage: "folder.badge.plus")
+                Image(systemName: "folder.badge.plus")
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.small)
-            .tint(.teal)
+            .buttonStyle(.bordered)
+            .help("Choose Folder")
 
-            // Quick locations menu
-            Menu {
-                Button("Home Folder (~)") {
-                    analyzer.scan(FileManager.default.homeDirectoryForCurrentUser)
-                }
-                Button("Downloads") {
-                    analyzer.scan(FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent("Downloads"))
-                }
-                Button("Documents") {
-                    analyzer.scan(FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent("Documents"))
-                }
-                Button("Desktop") {
-                    analyzer.scan(FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent("Desktop"))
-                }
-                Divider()
-                Button("/Applications") {
-                    analyzer.scan(URL(fileURLWithPath: "/Applications"))
-                }
-                Button("~/Library") {
-                    analyzer.scan(FileManager.default.homeDirectoryForCurrentUser
-                        .appendingPathComponent("Library"))
-                }
-            } label: {
-                Image(systemName: "chevron.down.circle")
-                    .font(.system(size: 14))
-            }
-            .menuStyle(.borderlessButton)
-            .frame(width: 26)
+            locationMenu
         }
-        .padding(.horizontal, 14)
-        .padding(.vertical, 10)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 16)
+        .background(.regularMaterial)
     }
 
-    // MARK: — Breadcrumb / title
+    private var locationMenu: some View {
+        Menu {
+            Button("Home Folder") { analyzer.scan(FileManager.default.homeDirectoryForCurrentUser) }
+            Button("Downloads") { analyzer.scan(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")) }
+            Button("Documents") { analyzer.scan(FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Documents")) }
+            Divider()
+            Button("/Applications") { analyzer.scan(URL(fileURLWithPath: "/Applications")) }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 20)
+    }
 
-    var breadcrumbOrTitle: some View {
+    private var breadcrumbOrTitle: some View {
         Group {
             if analyzer.breadcrumbs.isEmpty {
-                // No scan yet — plain title
-                HStack(spacing: 8) {
-                    Image(systemName: "internaldrive")
-                        .font(.system(size: 15))
+                HStack(spacing: 10) {
+                    Image(systemName: "internaldrive.fill")
+                        .font(.system(size: 18))
                         .foregroundColor(.teal)
                     Text("Disk Analyzer")
-                        .font(.system(size: 17, weight: .bold))
+                        .font(.system(size: 20, weight: .bold))
                 }
             } else {
                 BreadcrumbBar(
@@ -179,233 +176,273 @@ struct DiskAnalyzerView: View {
         }
     }
 
-    // MARK: — Chart panel (left)
+    // MARK: - Vault Hero
 
-    var chartPanel: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if let root = analyzer.rootURL {
-                volumeBar(for: root)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 10)
-                Divider()
-            }
-
-            ScrollView {
-                VStack(alignment: .leading, spacing: 3) {
-                    // Only chart real (non-pending) items to get correct scale
-                    let realItems    = analyzer.items.filter { !$0.isPending }
-                    let pendingItems = analyzer.items.filter {  $0.isPending }
-                    let chartItems   = Array(analyzer.items.prefix(chartLimit))
-                    // maxSize from real items only — never let a pending -1 distort scale
-                    let maxSize      = realItems.first?.size ?? 1
-                    // otherSize: only count real items beyond chartLimit
-                    let otherSize    = analyzer.items.dropFirst(chartLimit)
-                        .filter { !$0.isPending }
-                        .reduce(Int64(0)) { $0 + $1.size }
-                    let pendingCount = pendingItems.count
-
-                    ForEach(chartItems) { item in
-                        ChartBar(
-                            item:      item,
-                            maxSize:   maxSize,
-                            total:     analyzer.totalSize,
-                            isHovered: hoveredID == item.id,
-                            shimmer:   shimmer
-                        )
-                        .onHover { hoveredID = $0 ? item.id : nil }
-                        .onTapGesture {
-                            if item.isDir && !item.isPackage && !item.isPending {
-                                analyzer.drillDown(into: item)
-                            }
-                        }
-                        .contentShape(Rectangle())
-                    }
-
-                    // Pending summary row — shows how many folders are still sizing
-                    if pendingCount > 0 {
-                        PendingSummaryBar(count: pendingCount, shimmer: shimmer)
-                    }
-
-                    // "Other" bar — only real overflow items
-                    if otherSize > 0 {
-                        OtherBar(
-                            size:  otherSize,
-                            total: analyzer.totalSize,
-                            count: analyzer.items.filter { !$0.isPending }.count - chartLimit
-                        )
-                    }
-                }
-                .padding(12)
-            }
-        }
-    }
-
-    // MARK: — List panel (right)
-
-    var listPanel: some View {
-        VStack(spacing: 0) {
-            // Column headers
-            HStack(spacing: 0) {
-                Text("Name")
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                Text("Items")
-                    .frame(width: 55, alignment: .trailing)
-                Text("Size")
-                    .frame(width: 90, alignment: .trailing)
-                    .padding(.trailing, 14)
-            }
-            .font(.system(size: 11, weight: .semibold))
-            .foregroundColor(.secondary)
-            .padding(.horizontal, 14)
-            .padding(.vertical, 6)
-            .background(Color(NSColor.controlBackgroundColor).opacity(0.4))
-
-            Divider()
-
-            List(analyzer.items) { item in
-                DiskItemRow(item: item, total: analyzer.totalSize)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        if item.isDir && !item.isPackage && !item.isPending {
-                            analyzer.drillDown(into: item)
-                        }
-                    }
-                    .contextMenu {
-                        if !item.isPending {
-                            Button("Reveal in Finder") {
-                                NSWorkspace.shared.selectFile(
-                                    item.url.path,
-                                    inFileViewerRootedAtPath: "")
-                            }
-                        }
-                        if item.isDir && !item.isPackage && !item.isPending {
-                            Button("Drill Down") {
-                                analyzer.drillDown(into: item)
-                            }
-                        }
-                    }
-            }
-            .listStyle(.plain)
-        }
-    }
-
-    // MARK: — Volume bar
-
-    func volumeBar(for url: URL) -> some View {
+    private func volumeVaultHero(for url: URL) -> some View {
         let attrs   = try? FileManager.default.attributesOfFileSystem(forPath: url.path)
         let total   = attrs?[.systemSize]     as? Int64 ?? 1
         let free    = attrs?[.systemFreeSize] as? Int64 ?? 0
         let used    = total - free
-        let pctUsed = min(1.0, Double(used)  / Double(total))
-        let pctThis = analyzer.totalSize > 0
-            ? min(1.0, Double(analyzer.totalSize) / Double(total))
-            : 0.0
+        let pctUsed = Double(used) / Double(max(1, total))
+        let pctThis = analyzer.totalSize > 0 ? Double(analyzer.totalSize) / Double(max(1, total)) : 0.0
 
-        return VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text("Volume")
-                    .font(.system(size: 11, weight: .semibold))
+        return VStack(spacing: 20) {
+            HStack(spacing: 32) {
+                // Main Gauge
+                ZStack {
+                    Circle()
+                        .stroke(Color.primary.opacity(0.1), lineWidth: 12)
+                    Circle()
+                        .trim(from: 0, to: pctUsed)
+                        .stroke(
+                            AngularGradient(colors: [.teal, .blue, .purple], center: .center),
+                            style: StrokeStyle(lineWidth: 12, lineCap: .round)
+                        )
+                        .rotationEffect(.degrees(-90))
+                        .shadow(color: .teal.opacity(0.3), radius: 5)
+                    
+                    VStack(spacing: 2) {
+                        Text("\(Int(pctUsed * 100))%")
+                            .font(.system(size: 28, weight: .bold, design: .rounded))
+                        Text("TOTAL USED")
+                            .font(.system(size: 9, weight: .bold))
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(width: 120, height: 120)
+                
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(url.lastPathComponent)
+                            .font(.system(size: 24, weight: .bold))
+                        Text(url.path)
+                            .font(.system(size: 11))
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                    
+                    HStack(spacing: 20) {
+                        VaultStat(label: "FOLDER SIZE", value: DiskItem.formatSize(analyzer.totalSize), color: .teal)
+                        VaultStat(label: "AVAILABLE", value: DiskItem.formatSize(free), color: .blue)
+                    }
+                }
+                
                 Spacer()
-                Text("\(DiskItem.formatSize(free)) free of \(DiskItem.formatSize(total))")
-                    .font(.system(size: 10))
-                    .foregroundColor(.secondary)
+                
+                // Active Scan Glow
+                if analyzer.isScanning {
+                    Circle()
+                        .fill(Color.teal)
+                        .frame(width: 8, height: 8)
+                        .shadow(color: .teal, radius: 10)
+                        .opacity(shimmer ? 1 : 0.3)
+                        .animation(.easeInOut(duration: 0.8).repeatForever(), value: shimmer)
+                }
             }
-
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.secondary.opacity(0.12))
-                    // Used
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(Color.secondary.opacity(0.3))
-                        .frame(width: geo.size.width * CGFloat(pctUsed))
-                    // This folder
-                    if pctThis > 0 {
-                        RoundedRectangle(cornerRadius: 4)
-                            .fill(Color.teal)
+            
+            // Usage Bar
+            VStack(alignment: .leading, spacing: 8) {
+                GeometryReader { geo in
+                    ZStack(alignment: .leading) {
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.primary.opacity(0.05))
+                        
+                        // Other Used
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(Color.primary.opacity(0.15))
+                            .frame(width: geo.size.width * CGFloat(pctUsed))
+                        
+                        // Current Folder
+                        RoundedRectangle(cornerRadius: 6)
+                            .fill(
+                                LinearGradient(colors: [.teal, .blue], startPoint: .leading, endPoint: .trailing)
+                            )
                             .frame(width: geo.size.width * CGFloat(pctThis))
+                            .shadow(color: .teal.opacity(0.4), radius: 4)
                     }
                 }
-            }
-            .frame(height: 7)
-            .clipShape(RoundedRectangle(cornerRadius: 4))
-
-            HStack(spacing: 12) {
-                LegendDot(color: .teal,
-                          label: "This folder: \(DiskItem.formatSize(analyzer.totalSize))")
-                LegendDot(color: .secondary.opacity(0.3),
-                          label: "Other used: \(DiskItem.formatSize(max(0, used - analyzer.totalSize)))")
-                LegendDot(color: .secondary.opacity(0.1),
-                          label: "Free: \(DiskItem.formatSize(free))")
+                .frame(height: 12)
+                
+                HStack(spacing: 16) {
+                    LegendDot(color: .teal, label: "Current Folder")
+                    LegendDot(color: .primary.opacity(0.2), label: "Other Used")
+                    LegendDot(color: .primary.opacity(0.05), label: "Free Space")
+                }
             }
         }
+        .padding(32)
+        .background(.regularMaterial)
+        .cornerRadius(24)
+        .overlay(
+            RoundedRectangle(cornerRadius: 24)
+                .stroke(Color.primary.opacity(0.1), lineWidth: 1)
+        )
     }
 
-    // MARK: — States
-
-    var emptyState: some View {
+    private var welcomeHero: some View {
         VStack(spacing: 20) {
-            Image(systemName: "internaldrive")
-                .font(.system(size: 52))
-                .foregroundColor(.teal.opacity(0.35))
-
-            VStack(spacing: 6) {
-                Text("Analyze Disk Usage")
-                    .font(.system(size: 16, weight: .semibold))
-                Text("Select a folder to see what's using your space.\nFolders appear instantly as sizes calculate in the background.")
-                    .font(.system(size: 12))
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
+            Image(systemName: "internaldrive.fill")
+                .font(.system(size: 64))
+                .foregroundStyle(
+                    LinearGradient(colors: [.teal, .blue], startPoint: .topLeading, endPoint: .bottomTrailing)
+                )
+                .shadow(color: .teal.opacity(0.3), radius: 20)
+            
+            Text("Analyze Disk Usage")
+                .font(.system(size: 32, weight: .bold))
+            
+            Text("Select a folder to reveal its contents and reclaim your space.")
+                .font(.system(size: 16))
+                .foregroundColor(.secondary)
+            
+            Button {
+                showFilePicker = true
+            } label: {
+                Text("Select Folder")
+                    .font(.headline)
+                    .frame(width: 200, height: 44)
             }
+            .buttonStyle(.borderedProminent)
+            .tint(.teal)
+            .controlSize(.large)
+        }
+        .frame(maxWidth: .infinity, minHeight: 400)
+    }
 
-            HStack(spacing: 10) {
-                Button("Choose Folder…") { showFilePicker = true }
-                    .buttonStyle(.borderedProminent)
-                    .tint(.teal)
+    // MARK: - Panels
 
-                Menu("Quick Scan") {
-                    Button("Home (~)") {
-                        analyzer.scan(FileManager.default.homeDirectoryForCurrentUser)
+    private var chartPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            Text("MAJOR CONTRIBUTIONS")
+                .font(.system(size: 11, weight: .bold))
+                .foregroundColor(.secondary)
+                .kerning(1)
+            
+            VStack(spacing: 12) {
+                let realItems = analyzer.items.filter { !$0.isPending }
+                let maxSize = realItems.first?.size ?? 1
+                let chartItems = Array(analyzer.items.prefix(chartLimit))
+                
+                ForEach(chartItems) { item in
+                    ModernChartBar(
+                        item: item,
+                        maxSize: maxSize,
+                        total: analyzer.totalSize,
+                        isHovered: hoveredID == item.id,
+                        shimmer: shimmer
+                    ) {
+                        selectedItem = item
+                        showInspector = true
                     }
-                    Button("Downloads") {
-                        analyzer.scan(FileManager.default.homeDirectoryForCurrentUser
-                            .appendingPathComponent("Downloads"))
-                    }
-                    Button("Documents") {
-                        analyzer.scan(FileManager.default.homeDirectoryForCurrentUser
-                            .appendingPathComponent("Documents"))
-                    }
-                    Button("/Applications") {
-                        analyzer.scan(URL(fileURLWithPath: "/Applications"))
+                    .onHover { hoveredID = $0 ? item.id : nil }
+                }
+                
+                if analyzer.items.count > chartLimit {
+                    let otherItems = analyzer.items.dropFirst(chartLimit).filter { !$0.isPending }
+                    let otherSize = otherItems.reduce(0) { $0 + $1.size }
+                    if otherSize > 0 {
+                        OtherBar(size: otherSize, total: analyzer.totalSize, count: otherItems.count)
                     }
                 }
-                .menuStyle(.borderedButton)
             }
+            .padding(16)
+            .background(.regularMaterial)
+            .cornerRadius(16)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    var firstLoadState: some View {
-        VStack(spacing: 12) {
+    private var listPanel: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("ALL ITEMS")
+                    .font(.system(size: 11, weight: .bold))
+                    .foregroundColor(.secondary)
+                    .kerning(1)
+                Spacer()
+                TextField("Filter...", text: $searchText)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 120)
+            }
+            
+            VStack(spacing: 0) {
+                let displayed = analyzer.items.filter { item in
+                    guard !searchText.isEmpty else { return true }
+                    return item.name.lowercased().contains(searchText.lowercased())
+                }
+                
+                ForEach(displayed.prefix(50)) { item in
+                    DiskItemRow(item: item, total: analyzer.totalSize)
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            selectedItem = item
+                            showInspector = true
+                        }
+                    
+                    if item.id != displayed.prefix(50).last?.id {
+                        Divider().padding(.leading, 56)
+                    }
+                }
+            }
+            .background(.regularMaterial)
+            .cornerRadius(16)
+        }
+    }
+
+    private var scanningState: some View {
+        VStack(spacing: 24) {
             ProgressView()
-                .scaleEffect(1.1)
-            Text("Reading folder…")
-                .font(.system(size: 12))
+                .scaleEffect(1.5)
+            Text("Scanning structure...")
+                .font(.system(size: 20, weight: .bold))
+            Text(analyzer.progress)
                 .foregroundColor(.secondary)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, minHeight: 400)
     }
 
-    var emptyFolderState: some View {
-        VStack(spacing: 10) {
+    private var emptyState: some View {
+        VStack(spacing: 20) {
             Image(systemName: "tray")
-                .font(.system(size: 40))
-                .foregroundColor(.secondary.opacity(0.3))
-            Text("Empty folder")
-                .font(.system(size: 14))
+                .font(.system(size: 64))
+                .foregroundColor(.secondary.opacity(0.1))
+            Text("No content found")
+                .font(.headline)
                 .foregroundColor(.secondary)
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .frame(maxWidth: .infinity, minHeight: 400)
+    }
+}
+
+private struct VaultStat: View {
+    let label: String
+    let value: String
+    let color: Color
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text(label)
+                .font(.system(size: 9, weight: .bold))
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.system(size: 18, weight: .bold, design: .rounded))
+                .foregroundColor(color)
+        }
+    }
+}
+
+private struct ModernChartBar: View {
+    let item: DiskItem
+    let maxSize: Int64
+    let total: Int64
+    let isHovered: Bool
+    let shimmer: Bool
+    let action: () -> Void
+    
+    var body: some View {
+        Button(action: action) {
+            ChartBar(item: item, maxSize: maxSize, total: total, isHovered: isHovered, shimmer: shimmer)
+        }
+        .buttonStyle(.plain)
     }
 }
 

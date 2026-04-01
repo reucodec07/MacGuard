@@ -44,14 +44,14 @@ enum LoginItemType: String, CaseIterable {
 import SwiftUI  // Color used above needs this
 
 struct LoginItem: Identifiable, Hashable {
-    let id             = UUID()
+    var id: String { identifier }
     let identifier:      String        // bundle ID / launchd label
     let plistURL:        URL?          // path to .plist on disk
     let type:            LoginItemType
     let developerName:   String
     let developerID:     String        // Team ID
-    let rawDisposition:  Int           // BTM disposition bitmask
-    let associatedApp:   URL?          // resolved .app bundle if found
+    var rawDisposition:  Int           // BTM disposition bitmask
+    var associatedApp:   URL?          // resolved .app bundle if found
 
     // Disposition bitmask (from sfltool dumpbtm):
     // bit 0 (0x1) = enabled | bit 1 (0x2) = allowed by user
@@ -85,71 +85,202 @@ struct LoginItem: Identifiable, Hashable {
         }
     }
 
-    static func == (l: LoginItem, r: LoginItem) -> Bool { l.id == r.id }
-    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    static func == (l: LoginItem, r: LoginItem) -> Bool { l.identifier == r.identifier }
+    func hash(into hasher: inout Hasher) { hasher.combine(identifier) }
 }
 
 // MARK: — LoginItemsManager
+import UniformTypeIdentifiers
+import os.log
+import os.signpost
 
+@MainActor
 class LoginItemsManager: ObservableObject {
     @Published var items:         [LoginItem] = []
     @Published var isLoading      = false
     @Published var statusMessage  = ""
     @Published var needsFDA       = false   // Full Disk Access required for BTM
 
-    private var loadedLabels = Set<String>()   // from launchctl list (built once per refresh)
-    private let uid          = getuid()
+    private let uid = getuid()
+    nonisolated private let logger = Logger(subsystem: "com.macguard", category: "LoginItems")
+    
+    // Refresh generation token for overlapping cancellations
+    private var refreshGeneration = 0
+    private var currentRefreshTask: Task<Void, Never>?
+    private var sources: [DispatchSourceFileSystemObject] = []
+    
+    #if DEBUG
+    var refreshCount = 0
+    var btmParseCount = 0
+    var lastRefreshDuration: TimeInterval = 0
+    var diagnostics: [String: Any] {
+        [
+            "refreshCount": refreshCount,
+            "btmParseCount": btmParseCount,
+            "lastRefreshDuration": lastRefreshDuration,
+            "watchedPaths": sources.count
+        ]
+    }
+    #endif
+
+    init(watchPaths: [String]? = nil) {
+        setupWatchers(paths: watchPaths)
+    }
+
+    private func setupWatchers(paths overridePaths: [String]? = nil) {
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        let paths = ["/Library/LaunchDaemons", "/Library/LaunchAgents", "\(home)/Library/LaunchAgents"]
+        
+        for path in paths {
+            let fd = open(path, O_EVTONLY)
+            if fd == -1 {
+                logger.error("Failed to open watcher for \(path): \(String(cString: strerror(errno)))")
+                continue 
+            }
+            
+            let source = DispatchSource.makeFileSystemObjectSource(
+                fileDescriptor: fd,
+                eventMask: [.write, .rename],
+                queue: DispatchQueue.main
+            )
+            var debounceWorkItem: DispatchWorkItem?
+            source.setEventHandler { [weak self] in
+                debounceWorkItem?.cancel()
+                let task = DispatchWorkItem { self?.refresh() }
+                debounceWorkItem = task
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: task)
+            }
+            source.setCancelHandler { close(fd) }
+            source.resume()
+            sources.append(source)
+        }
+    }
 
     // MARK: — Refresh
 
     func refresh() {
+        refreshGeneration += 1
+        let gen = refreshGeneration
+        #if DEBUG
+        refreshCount += 1
+        #endif
+        
+        currentRefreshTask?.cancel()
+        currentRefreshTask = Task { await asyncRefresh(generation: gen) }
+    }
+
+    @MainActor
+    private func asyncRefresh(generation: Int) async {
         isLoading     = true
         statusMessage = "Loading background tasks…"
         items         = []
         needsFDA      = false
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
+        let t0 = Date()
+        #if DEBUG
+        let start = Date()
+        #endif
+        let (sortedItems, msg, fda) = await Task(priority: .userInitiated) { [logger] () -> ([LoginItem], String, Bool) in
+            let signposter = OSSignposter(logger: logger)
+            let spSys = signposter.beginInterval("SystemCache_build", id: .exclusive)
+            
+            // 1. Get Loaded Labels
+            let userList = await ProcessRunner.shared.run("/bin/launchctl", ["list"]).stdout
+            let loadedLabels = Set(
+                userList.components(separatedBy: "\n")
+                    .compactMap { line -> String? in
+                        let cols = line.components(separatedBy: "\t")
+                        return cols.count >= 3 ? cols[2].trimmingCharacters(in: .whitespaces) : nil
+                    }
+                    .filter { !$0.isEmpty && $0 != "Label" }
+            )
+            
+            // System Cache single-pass execution
+            let tCache = Date()
+            let systemCache = await LoginItemsCaches.shared.getSystemCache()
+            
+            let cpuCnt = max(2, ProcessInfo.processInfo.activeProcessorCount)
+            let fallbackLimiter = ConcurrentLimiter(limit: min(4, cpuCnt))
+            logger.debug("System cache built in \(Date().timeIntervalSince(tCache))s")
+            signposter.endInterval("SystemCache_build", spSys)
 
-            // Build loaded-label set from launchctl list (one call, no per-plist subprocess)
-            // NOTE: launchctl list (no sudo) returns USER-domain services only.
-            // sudo launchctl list returns SYSTEM-domain. We call both via osascript.
-            self.buildLoadedLabelsCache()
+            var appCache = await LoginItemsCaches.shared.getAppCache()
+            var parsed = [LoginItem]()
+            var usedBTM = false
+            
+            let spBtm = signposter.beginInterval("BTM_dump", id: .exclusive)
+            let tBtm = Date()
+            // 2. Dump BTM
+            let btmOutput = await ProcessRunner.shared.run("/usr/bin/sfltool", ["dumpbtm"], timeout: 5.0).stdout
+            logger.debug("Dump BTM finished in \(Date().timeIntervalSince(tBtm))s")
 
-            var parsed       = [LoginItem]()
-            var usedBTM      = false
-
-            // Primary: sfltool dumpbtm (requires Full Disk Access on macOS 13+)
-            let btmOutput = self.run("/usr/bin/sfltool", ["dumpbtm"])
             if btmOutput.contains("Entry[") || btmOutput.contains("identifier:") {
-                parsed  = self.parseBTM(btmOutput)
+                let tParse = Date()
+                parsed = await Self.parseBTM(btmOutput, loadedLabels: loadedLabels, systemCache: systemCache, fallbackLimiter: fallbackLimiter, cache: &appCache)
+                #if DEBUG
+                btmParseCount += 1
+                #endif
+                logger.debug("Parse BTM finished in \(Date().timeIntervalSince(tParse))s")
                 usedBTM = true
             } else if btmOutput.lowercased().contains("operation not permitted") ||
                       btmOutput.lowercased().contains("permission denied") ||
                       btmOutput.isEmpty {
-                // BTM is unreadable — Full Disk Access not granted
-                // Fall through to directory scan only
+                // Fall through to directory scan only (Full Disk Access missing)
             }
-
-            // Supplement / fallback: scan plist directories directly
-            // Catches items not in BTM (older macOS, manually placed plists)
-            // and fills in when BTM is inaccessible
-            let supplemental = self.scanPlistDirectories()
-            var knownIDs     = Set(parsed.map { $0.identifier })
+            signposter.endInterval("BTM_dump", spBtm)
+            
+            let spDir = signposter.beginInterval("DirScan", id: .exclusive)
+            let tScan = Date()
+            // 3. Scan Plist Directories
+            let supplemental = await Self.scanPlistDirectories(loadedLabels: loadedLabels, systemCache: systemCache, fallbackLimiter: fallbackLimiter)
+            logger.debug("Directory Scan finished in \(Date().timeIntervalSince(tScan))s")
+            signposter.endInterval("DirScan", spDir)
+            
+            var knownIDs = Set(parsed.map { $0.identifier })
             for item in supplemental where !knownIDs.contains(item.identifier) {
                 parsed.append(item)
                 knownIDs.insert(item.identifier)
             }
 
-            // Filter out Apple's own system services (they're not useful to show
-            // in a user-facing manager — /System/Library entries)
+            // 4. Resolve Associated Apps Concurrently
+            let spApp = signposter.beginInterval("AssocApp_resolve", id: .exclusive)
+            let uniqueIDs = Array(Set(parsed.map { $0.identifier }).filter { appCache[$0] == nil })
+            
+            await withTaskGroup(of: (String, URL?).self) { group in
+                var active = 0
+                for ident in uniqueIDs {
+                    if active >= min(4, cpuCnt) {
+                        if let res = await group.next(), let url = res.1 { appCache[res.0] = url }
+                        active -= 1
+                    }
+                    group.addTask {
+                        let url = await Self.findAssociatedApp(identifier: ident)
+                        return (ident, url)
+                    }
+                    active += 1
+                }
+                for await res in group {
+                    if let url = res.1 { appCache[res.0] = url }
+                }
+            }
+            
+            await LoginItemsCaches.shared.updateAppCache(appCache)
+            
+            for i in parsed.indices {
+                if let url = appCache[parsed[i].identifier] {
+                    parsed[i].associatedApp = url
+                }
+            }
+            signposter.endInterval("AssocApp_resolve", spApp)
+
+            let spSort = signposter.beginInterval("Merge_sort", id: .exclusive)
+            // Filter out Apple's own system services
             let filtered = parsed.filter { item in
                 guard let url = item.plistURL else { return true }
                 return !url.path.hasPrefix("/System/Library")
             }
 
             let sorted = filtered.sorted {
-                // Enabled first, then by type severity, then alphabetical
                 if $0.isEnabled != $1.isEnabled { return $0.isEnabled }
                 if $0.type != $1.type {
                     let order: [LoginItemType] = [.launchDaemon, .launchAgent, .loginItem, .backgroundItem, .unknown]
@@ -166,51 +297,38 @@ class LoginItemsManager: ObservableObject {
             var msg         = "\(sorted.count) items · \(enabledCnt) enabled · \(disabledCnt) disabled"
             if adminCnt > 0 { msg += " · \(adminCnt) need admin" }
             if !usedBTM     { msg += " · (BTM unavailable — grant Full Disk Access for full results)" }
-
-            DispatchQueue.main.async {
-                self.items         = sorted
-                self.isLoading     = false
-                self.statusMessage = msg
-                self.needsFDA      = !usedBTM
-            }
+            signposter.endInterval("Merge_sort", spSort)
+            
+            return (sorted, msg, !usedBTM)
+        }.value
+        
+        guard generation == refreshGeneration, !Task.isCancelled else {
+            logger.debug("Discarding stale refresh results (generation \(generation))")
+            return
         }
+        
+        self.items         = sortedItems
+        self.statusMessage = msg
+        self.needsFDA      = fda
+        self.isLoading     = false
+        #if DEBUG
+        self.lastRefreshDuration = Date().timeIntervalSince(start)
+        #endif
+        self.logger.debug("Refresh complete in \(Date().timeIntervalSince(t0))s total.")
     }
 
-    // MARK: — launchctl list cache (one call covers all user-domain services)
-    private func buildLoadedLabelsCache() {
-        // User domain
-        let userList = run("/bin/launchctl", ["list"])
-        // System domain (no sudo available here — use print to check specific labels later)
-        loadedLabels = Set(
-            userList.components(separatedBy: "\n")
-                .compactMap { line -> String? in
-                    let cols = line.components(separatedBy: "\t")
-                    return cols.count >= 3 ? cols[2].trimmingCharacters(in: .whitespaces) : nil
-                }
-                .filter { !$0.isEmpty && $0 != "Label" }
-        )
-    }
-
-    // MARK: — Parse sfltool dumpbtm
-
-    private func parseBTM(_ output: String) -> [LoginItem] {
+    // MARK: — Parsing
+    
+    static func parseBTM(_ output: String, loadedLabels: Set<String>, systemCache: Set<String>, fallbackLimiter: ConcurrentLimiter, cache: inout [String: URL]) async -> [LoginItem] {
         let fm = FileManager.default
         var results = [LoginItem]()
-
-        // sfltool dumpbtm separates entries with blank lines
-        // Each entry looks like:
-        //   Entry[N]
-        //     url: file:///path/to/plist
-        //     type: launchd            ← NOT "LaunchDaemon"/"LaunchAgent"
-        //     disposition: [...] 0xN
-        //     identifier: com.example.app
-        //     developer name: Example Corp
-        //     developer id: TEAMID
-        let blocks = output.components(separatedBy: "\n\n")
+        let blocks = output.split(separator: "\n\n", omittingEmptySubsequences: true)
+        let ws = CharacterSet.whitespaces
 
         for block in blocks {
-            guard block.contains("identifier:") || block.contains("url:") else { continue }
-            let lines = block.components(separatedBy: "\n")
+            let blockStr = String(block)
+            guard blockStr.range(of: "identifier:", options: .caseInsensitive) != nil || blockStr.range(of: "url:", options: .caseInsensitive) != nil else { continue }
+            let lines = blockStr.split(separator: "\n", omittingEmptySubsequences: true)
 
             var rawURL    = ""
             var rawType   = ""
@@ -220,32 +338,31 @@ class LoginItemsManager: ObservableObject {
             var devID     = ""
 
             for line in lines {
-                let t = line.trimmingCharacters(in: .whitespaces)
-                if      t.hasPrefix("url:")              { rawURL  = val(t, "url:") }
-                else if t.hasPrefix("type:")             { rawType = val(t, "type:") }
-                else if t.hasPrefix("identifier:")       { ident   = val(t, "identifier:") }
-                else if t.hasPrefix("developer name:")   { devName = val(t, "developer name:") }
-                else if t.hasPrefix("developer id:")     { devID   = val(t, "developer id:") }
-                else if t.hasPrefix("disposition:") {
-                    // "disposition: [enabled, allowed, visible, notified] 0xf"
-                    // Extract the trailing hex value — most reliable across macOS versions
+                let t = String(line).trimmingCharacters(in: ws)
+                
+                if t.range(of: "url:", options: [.caseInsensitive, .anchored]) != nil              { rawURL  = Self.val(t, "url:") }
+                else if t.range(of: "type:", options: [.caseInsensitive, .anchored]) != nil             { rawType = Self.val(t, "type:") }
+                else if t.range(of: "identifier:", options: [.caseInsensitive, .anchored]) != nil       { ident   = Self.val(t, "identifier:") }
+                else if t.range(of: "developer name:", options: [.caseInsensitive, .anchored]) != nil   { devName = Self.val(t, "developer name:") }
+                else if t.range(of: "developer id:", options: [.caseInsensitive, .anchored]) != nil     { devID   = Self.val(t, "developer id:") }
+                else if t.range(of: "team identifier:", options: [.caseInsensitive, .anchored]) != nil  { devID   = Self.val(t, "team identifier:") }
+                else if t.range(of: "disposition:", options: [.caseInsensitive, .anchored]) != nil {
+                    let tl = t.lowercased()
                     if let hexToken = t.components(separatedBy: "]").last?
-                        .trimmingCharacters(in: .whitespaces),
+                        .trimmingCharacters(in: ws).lowercased(),
                        hexToken.hasPrefix("0x"),
                        let val = Int(hexToken.dropFirst(2), radix: 16) {
                         disp = val
                     } else {
-                        // Fallback: parse flag names
-                        if t.contains("enabled")  && !t.contains("not enabled")  { disp |= 0x1 }
-                        if t.contains("allowed")  && !t.contains("not allowed")  { disp |= 0x2 }
-                        if t.contains("visible")  && !t.contains("not visible")  { disp |= 0x4 }
+                        if tl.contains("enabled")  && !tl.contains("not enabled")  { disp |= 0x1 }
+                        if tl.contains("allowed")  && !tl.contains("not allowed")  { disp |= 0x2 }
+                        if tl.contains("visible")  && !tl.contains("not visible")  { disp |= 0x4 }
                     }
                 }
             }
 
             guard !ident.isEmpty || !rawURL.isEmpty else { continue }
 
-            // Resolve plist URL
             let plistPath = rawURL
                 .replacingOccurrences(of: "file://", with: "")
                 .removingPercentEncoding ?? rawURL.replacingOccurrences(of: "file://", with: "")
@@ -254,19 +371,29 @@ class LoginItemsManager: ObservableObject {
                 return fm.fileExists(atPath: u.path) ? u : nil
             }()
 
-            // Derive identifier from plist filename if missing
             if ident.isEmpty, let u = plistURL {
                 ident = u.deletingPathExtension().lastPathComponent
             }
 
-            // Derive type from URL path — "type: launchd" doesn't distinguish daemon vs agent
-            let itemType = deriveType(urlPath: plistPath, btmType: rawType)
+            let itemType = Self.deriveType(urlPath: plistPath, btmType: rawType)
 
-            // For supplemental items not in BTM, check launchctl list for loaded state
             var finalDisp = disp
             if disp == 0 && loadedLabels.contains(ident) { finalDisp = 0x3 }
-
-            let appURL = findAssociatedApp(identifier: ident)
+            
+            // SYSTEM-domain probe for BTM daemons if disp doesn't say it's enabled
+            if (disp & 0x1) == 0 && itemType == .launchDaemon {
+                if !systemCache.isEmpty {
+                    if systemCache.contains(ident) {
+                        finalDisp |= 0x3 // Force enabled/allowed flag
+                    }
+                } else {
+                    let loaded = await fallbackLimiter.execute {
+                        let sysOut = await ProcessRunner.shared.run("/bin/launchctl", ["print", "system/\(ident)"], timeout: 2.0).stdout
+                        return !sysOut.contains("Bad request") && !sysOut.contains("Could not find")
+                    }
+                    if loaded { finalDisp |= 0x3 }
+                }
+            }
 
             results.append(LoginItem(
                 identifier:    ident,
@@ -275,15 +402,13 @@ class LoginItemsManager: ObservableObject {
                 developerName: devName,
                 developerID:   devID,
                 rawDisposition: finalDisp,
-                associatedApp: appURL
+                associatedApp: nil
             ))
         }
         return results
     }
 
-    // MARK: — Supplemental directory scan
-
-    private func scanPlistDirectories() -> [LoginItem] {
+    private static func scanPlistDirectories(loadedLabels: Set<String>, systemCache: Set<String>, fallbackLimiter: ConcurrentLimiter) async -> [LoginItem] {
         let fm   = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
         var results = [LoginItem]()
@@ -300,28 +425,29 @@ class LoginItemsManager: ObservableObject {
                 at: dirURL, includingPropertiesForKeys: nil) else { continue }
 
             for plist in plists where plist.pathExtension == "plist" {
-                guard let dict = NSDictionary(contentsOf: plist) else { continue }
-                let label = (dict["Label"] as? String)
-                    ?? plist.deletingPathExtension().lastPathComponent
+                var label = plist.deletingPathExtension().lastPathComponent
+                if let data = try? Data(contentsOf: plist),
+                   let root = try? PropertyListSerialization.propertyList(from: data, options: [], format: nil) as? [String: Any],
+                   let l = root["Label"] as? String {
+                    label = l
+                }
 
-                // Check loaded state from our pre-built cache (no extra subprocess)
                 let isLoaded = loadedLabels.contains(label)
-
-                // Also check system domain via launchctl print (fast targeted call)
-                let systemLoaded: Bool
+                var systemLoaded = false
                 if type == .launchDaemon {
-                    let out = run("/bin/launchctl", ["print", "system/\(label)"])
-                    systemLoaded = !out.contains("Bad request") &&
-                                   !out.contains("Could not find")
-                } else {
-                    systemLoaded = false
+                    if !systemCache.isEmpty {
+                        systemLoaded = systemCache.contains(label)
+                    } else {
+                        systemLoaded = await fallbackLimiter.execute {
+                            let out = await ProcessRunner.shared.run("/bin/launchctl", ["print", "system/\(label)"], timeout: 2.0).stdout
+                            return !out.contains("Bad request") && !out.contains("Could not find")
+                        }
+                    }
                 }
 
                 let loaded = isLoaded || systemLoaded
-                // bit 0 = enabled, bit 1 = allowed (we assume allowed for directory items)
                 let disposition = loaded ? 0x3 : 0x2
 
-                let appURL = findAssociatedApp(identifier: label)
                 results.append(LoginItem(
                     identifier:     label,
                     plistURL:       plist,
@@ -329,7 +455,7 @@ class LoginItemsManager: ObservableObject {
                     developerName:  "",
                     developerID:    "",
                     rawDisposition: disposition,
-                    associatedApp:  appURL
+                    associatedApp:  nil
                 ))
             }
         }
@@ -337,9 +463,7 @@ class LoginItemsManager: ObservableObject {
     }
 
     // MARK: — Type derivation
-    // sfltool reports type "launchd" for both daemons and agents.
-    // The URL path is the only reliable way to distinguish them.
-    private func deriveType(urlPath: String, btmType: String) -> LoginItemType {
+    static func deriveType(urlPath: String, btmType: String) -> LoginItemType {
         if urlPath.contains("/LaunchDaemons/")           { return .launchDaemon   }
         if urlPath.contains("/LaunchAgents/")            { return .launchAgent    }
         let t = btmType.lowercased()
@@ -349,7 +473,17 @@ class LoginItemsManager: ObservableObject {
     }
 
     // MARK: — Find associated .app
-    private func findAssociatedApp(identifier: String) -> URL? {
+    @MainActor
+    private static func nsWorkspaceURL(for identifier: String) -> URL? {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier)
+    }
+
+    private static func findAssociatedApp(identifier: String) async -> URL? {
+        // 1. O(1) exact match
+        if let url = nsWorkspaceURL(for: identifier) {
+            return url
+        }
+
         let fm   = FileManager.default
         let home = fm.homeDirectoryForCurrentUser.path
         let parts = identifier.components(separatedBy: ".")
@@ -364,172 +498,221 @@ class LoginItemsManager: ObservableObject {
                 let plist = item.appendingPathComponent("Contents/Info.plist")
                 if let dict = NSDictionary(contentsOf: plist),
                    let bid  = dict["CFBundleIdentifier"] as? String {
-                    if bid.lowercased() == identifier.lowercased()   { return item }
-                    // Fuzzy: identifier starts with app's bundle ID (e.g. helper of the app)
-                    if identifier.lowercased().hasPrefix(bid.lowercased()) { return item }
+                    if bid.lowercased() == identifier.lowercased()   {
+                        return item
+                    }
+                    if identifier.lowercased().hasPrefix(bid.lowercased()) {
+                        return item
+                    }
                 }
                 let appName = item.deletingPathExtension().lastPathComponent.lowercased()
-                if parts.contains(where: { appName.contains($0) })  { return item }
+                if parts.contains(where: { appName.contains($0) }) {
+                    return item
+                }
             }
         }
         return nil
     }
 
+    private static func val(_ line: String, _ prefix: String) -> String {
+        line.replacingOccurrences(of: prefix, with: "", options: .caseInsensitive).trimmingCharacters(in: .whitespaces)
+    }
+
     // MARK: — Toggle
 
     func toggle(_ item: LoginItem, completion: @escaping (Bool, String) -> Void) {
-        item.isEnabled ? disable(item, completion: completion)
-                       : enable(item,  completion: completion)
-    }
-
-    private func enable(_ item: LoginItem, completion: @escaping (Bool, String) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            var success = false
-
-            if let plist = item.plistURL {
-                if item.type.requiresAdmin {
-                    let s = "do shell script \"launchctl load -w '\(plist.path.esc)'\" with administrator privileges"
-                    var err: NSDictionary?
-                    NSAppleScript(source: s)?.executeAndReturnError(&err)
-                    success = err == nil
-                } else {
-                    // Try modern bootstrap first, fall back to legacy load
-                    let domain = "gui/\(self.uid)"
-                    _ = self.run("/bin/launchctl", ["enable", "\(domain)/\(item.identifier)"])
-                    let out = self.run("/bin/launchctl", ["bootstrap", domain, plist.path])
-                    success = !out.lowercased().contains("error") || out.isEmpty
-                    if !success {
-                        let out2 = self.run("/bin/launchctl", ["load", "-w", plist.path])
-                        success  = !out2.lowercased().contains("error")
-                    }
-                }
-            } else {
-                // SMAppService-registered item — no plist we can control
-                let domain = "gui/\(self.uid)"
-                _ = self.run("/bin/launchctl", ["enable", "\(domain)/\(item.identifier)"])
-                success = true
-            }
-
-            if success { self.refresh() }
-            DispatchQueue.main.async {
-                completion(success,
-                    success ? "✅ \(item.displayName) enabled"
-                            : "❌ Failed to enable \(item.displayName)")
-            }
+        Task {
+            let res = item.isEnabled ? await disable(item, refreshAfter: true) : await enable(item, refreshAfter: true)
+            completion(res.success, res.message)
         }
     }
 
-    private func disable(_ item: LoginItem, completion: @escaping (Bool, String) -> Void) {
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-            var success = false
+    private func enable(_ item: LoginItem, refreshAfter: Bool = true) async -> (success: Bool, message: String) {
+        var success = false
 
-            if let plist = item.plistURL {
-                if item.type.requiresAdmin {
-                    let e = plist.path.esc
-                    let s = "do shell script \"launchctl unload -w '\(e)'\" with administrator privileges"
-                    var err: NSDictionary?
-                    NSAppleScript(source: s)?.executeAndReturnError(&err)
-                    success = err == nil
-                } else {
-                    let domain = "gui/\(self.uid)"
-                    // Modern: bootout + disable (persists across reboots)
-                    _ = self.run("/bin/launchctl", ["bootout",  "\(domain)/\(item.identifier)"])
-                    _ = self.run("/bin/launchctl", ["disable",  "\(domain)/\(item.identifier)"])
-                    // Legacy fallback: unload -w (sets Disabled key in plist)
-                    _ = self.run("/bin/launchctl", ["unload", "-w", plist.path])
+        if let plist = item.plistURL {
+            if item.type.requiresAdmin {
+                let lines = ["launchctl load -w '\(plist.path.esc)' 2>/dev/null", "echo \"OK\""]
+                let res = await ProcessRunner.shared.runAdminScript(lines)
+                success = res.success
+            } else {
+                let domain = "gui/\(self.uid)"
+                _ = await ProcessRunner.shared.run("/bin/launchctl", ["enable", "\(domain)/\(item.identifier)"], timeout: 5.0)
+                let res = await ProcessRunner.shared.run("/bin/launchctl", ["bootstrap", domain, plist.path], timeout: 5.0)
+                success = res.exitCode == 0
+                if !success {
+                    let res2 = await ProcessRunner.shared.run("/bin/launchctl", ["load", "-w", plist.path], timeout: 5.0)
+                    success  = res2.exitCode == 0
+                }
+            }
+        } else {
+            let domain = "gui/\(self.uid)"
+            let res = await ProcessRunner.shared.run("/bin/launchctl", ["enable", "\(domain)/\(item.identifier)"], timeout: 5.0)
+            success = res.exitCode == 0
+        }
+
+        if success && refreshAfter { refresh() }
+        let msg = success ? "✅ \(item.displayName) enabled" : "❌ Failed to enable \(item.displayName)"
+        return (success, msg)
+    }
+
+    private func disable(_ item: LoginItem, refreshAfter: Bool = true) async -> (success: Bool, message: String) {
+        var success = false
+
+        if let plist = item.plistURL {
+            if item.type.requiresAdmin {
+                let lines = ["launchctl unload -w '\(plist.path.esc)' 2>/dev/null", "echo \"OK\""]
+                let res = await ProcessRunner.shared.runAdminScript(lines)
+                success = res.success
+            } else {
+                let domain = "gui/\(self.uid)"
+                _ = await ProcessRunner.shared.run("/bin/launchctl", ["bootout",  "\(domain)/\(item.identifier)"], timeout: 5.0)
+                _ = await ProcessRunner.shared.run("/bin/launchctl", ["disable",  "\(domain)/\(item.identifier)"], timeout: 5.0)
+                let res = await ProcessRunner.shared.run("/bin/launchctl", ["unload", "-w", plist.path], timeout: 5.0)
+                success = res.exitCode == 0 || res.stderr.isEmpty || res.stderr.contains("Could not find specified service")
+                if res.exitCode != 0 {
+                    self.logger.warning("Unload returned non-zero for \(item.identifier) via \(res.stderr). Assuming gracefully disabled.")
                     success = true
                 }
-            } else {
-                let domain = "gui/\(self.uid)"
-                _ = self.run("/bin/launchctl", ["disable", "\(domain)/\(item.identifier)"])
-                success = true
             }
-
-            if success { self.refresh() }
-            DispatchQueue.main.async {
-                completion(success,
-                    success ? "✅ \(item.displayName) disabled"
-                            : "❌ Failed to disable \(item.displayName)")
-            }
+        } else {
+            let domain = "gui/\(self.uid)"
+            let res = await ProcessRunner.shared.run("/bin/launchctl", ["disable", "\(domain)/\(item.identifier)"], timeout: 5.0)
+            success = res.exitCode == 0
         }
+
+        if success && refreshAfter { refresh() }
+        let msg = success ? "✅ \(item.displayName) disabled" : "❌ Failed to disable \(item.displayName)"
+        return (success, msg)
     }
 
     // MARK: — Remove
     func remove(_ item: LoginItem, completion: @escaping (Bool, String) -> Void) {
         guard let plist = item.plistURL else {
-            DispatchQueue.main.async {
-                completion(false, "❌ No plist file — cannot remove (SMAppService items must be removed by the app itself)")
-            }
+            completion(false, "❌ No plist file — cannot remove (SMAppService items must be removed by the app itself)")
             return
         }
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
+        Task {
             var success = false
 
             if item.type.requiresAdmin {
                 let e = plist.path.esc
-                let s = """
-                do shell script "launchctl bootout system/\(item.identifier.esc) 2>/dev/null; \
-                launchctl unload -w '\(e)' 2>/dev/null; \
-                rm -f '\(e)'" with administrator privileges
-                """
-                var err: NSDictionary?
-                NSAppleScript(source: s)?.executeAndReturnError(&err)
-                success = err == nil
+                let lines = [
+                    "launchctl bootout system/'\(item.identifier.esc)' 2>/dev/null",
+                    "launchctl unload -w '\(e)' 2>/dev/null",
+                    "rm -f '\(e)'"
+                ]
+                let res = await ProcessRunner.shared.runAdminScript(lines)
+                success = res.success
             } else {
                 let domain = "gui/\(self.uid)"
-                _ = self.run("/bin/launchctl", ["bootout", "\(domain)/\(item.identifier)"])
-                _ = self.run("/bin/launchctl", ["disable", "\(domain)/\(item.identifier)"])
+                _ = await ProcessRunner.shared.run("/bin/launchctl", ["bootout", "\(domain)/\(item.identifier)"], timeout: 5.0)
+                _ = await ProcessRunner.shared.run("/bin/launchctl", ["disable", "\(domain)/\(item.identifier)"], timeout: 5.0)
                 success = (try? FileManager.default.removeItem(at: plist)) != nil
             }
 
             if success { self.refresh() }
-            DispatchQueue.main.async {
-                completion(success,
-                    success ? "✅ \(item.displayName) removed"
-                            : "❌ Failed to remove \(item.displayName)")
-            }
+            
+            let msg = success ? "✅ \(item.displayName) removed" : "❌ Failed to remove \(item.displayName)"
+            completion(success, msg)
         }
     }
 
     // MARK: — Helpers
     func revealInFinder(_ item: LoginItem) {
         if let url = item.plistURL {
-            NSWorkspace.shared.selectFile(url.path, inFileViewerRootedAtPath: "")
-        } else if let url = item.associatedApp {
             NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+    }
+
+    func revealAppInFinder(_ item: LoginItem) {
+        if let app = item.associatedApp {
+            NSWorkspace.shared.activateFileViewerSelecting([app])
+        }
+    }
+
+    @MainActor
+    func exportItems() {
+        let text = items.map { "[\($0.isEnabled ? "ON" : "OFF")] \($0.displayName) (\($0.identifier)) - \($0.type.displayName)" }.joined(separator: "\n")
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.nameFieldStringValue = "MacGuard_LoginItems.txt"
+        
+        if panel.runModal() == .OK, let url = panel.url {
+            try? text.write(to: url, atomically: true, encoding: .utf8)
+        }
+    }
+
+    @MainActor
+    func exportItemsJSON() -> Data? {
+        let exportData = items.map { item in
+            [
+                "identifier": item.identifier,
+                "type": item.type.rawValue,
+                "developerName": item.developerName,
+                "isEnabled": item.isEnabled,
+                "associatedApp": item.associatedApp?.path ?? "",
+                "plistPath": item.plistURL?.path ?? ""
+            ] as [String : Any]
+        }
+        
+        return try? JSONSerialization.data(withJSONObject: exportData, options: .prettyPrinted)
+    }
+
+    @MainActor
+    func showExportJSONPanel() {
+        guard let data = exportItemsJSON() else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "MacGuard_LoginItems.json"
+        
+        if panel.runModal() == .OK, let url = panel.url {
+            try? data.write(to: url)
+        }
+    }
+
+    func disableAllNonApple(completion: @escaping (Int) -> Void) {
+        let nonAppleItems = items.filter { 
+            $0.isEnabled && 
+            !$0.developerName.lowercased().contains("apple") &&
+            !$0.identifier.lowercased().hasPrefix("com.apple.")
+        }
+        
+        guard !nonAppleItems.isEmpty else { 
+            DispatchQueue.main.async { completion(0) }
+            return
+        }
+        
+        Task {
+            var count = 0
+            await withTaskGroup(of: Bool.self) { group in
+                var active = 0
+                for item in nonAppleItems {
+                    if active >= 2 {
+                        if await group.next() == true { count += 1 }
+                        active -= 1
+                    }
+                    group.addTask {
+                        let res = await self.disable(item, refreshAfter: false)
+                        return res.success
+                    }
+                    active += 1
+                }
+                for await res in group {
+                    if res { count += 1 }
+                }
+            }
+            await MainActor.run { 
+                self.refresh()
+                completion(count) 
+            }
         }
     }
 
     func openSystemSettings() {
         NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.LoginItems-Settings.extension")!)
     }
-
-    @discardableResult
-    private func run(_ path: String, _ args: [String], timeout: TimeInterval = 10) -> String {
-        let task = Process()
-        task.executableURL  = URL(fileURLWithPath: path)
-        task.arguments      = args
-        let pipe            = Pipe()
-        task.standardOutput = pipe
-        task.standardError  = Pipe()   // stderr isolated — never mixed into output
-        guard (try? task.run()) != nil else { return "" }
-        let killer = DispatchWorkItem { task.terminate() }
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killer)
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        killer.cancel()
-        task.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
-    }
-
-    private func val(_ line: String, _ prefix: String) -> String {
-        line.replacingOccurrences(of: prefix, with: "").trimmingCharacters(in: .whitespaces)
-    }
 }
 
-private extension String {
-    var esc: String { replacingOccurrences(of: "'", with: "'\\''") }
-}
+// Extension removed in favor of shared String+Escaping.swift

@@ -190,68 +190,28 @@ class CleanupEngine: ObservableObject {
                 self.isAnalysing  = false
 
                 // Phase 2 — AI enhancement if key provided
-                if let key = apiKey, !key.isEmpty {
-
-                    // Precision filter — only send items where rule engine
-                    // genuinely cannot make the right call alone.
-                    let ambiguous = sorted.filter { item in
-                        let path = item.url.path
-                        let name = item.name.lowercased()
-                        let ext  = item.url.pathExtension.lowercased()
-
-                        // 1. Rule engine gave up — unknown category
-                        if item.category == .unknown { return true }
-
-                        // 2. App containers — Haiku judges active vs abandoned.
-                        //    This is where AI adds the most value (confirmed by logs).
-                        if path.contains("/Containers/") ||
-                           path.contains("/Group Containers/") { return true }
-
-                        // 3. Large uncertain items >50MB — worth the API cost.
-                        //    Small uncertain files are not.
-                        if item.safety != .safe && item.size > 52_428_800 { return true }
-
-                        // 4. Ambiguous filenames on non-safe items —
-                        //    installers, old projects, copies the rule engine
-                        //    can flag but not contextually evaluate.
-                        let ambiguousExts  = ["xip","pkg","dmg"]
-                        let ambiguousNames = ["backup","archive","old","copy",
-                                              "version","install","setup"]
-                        if item.safety != .safe && (
-                            ambiguousExts.contains(ext) ||
-                            ambiguousNames.contains(where: { name.contains($0) })
-                        ) { return true }
-
-                        // Safe items and well-understood patterns — skip AI
-                        return false
-                    }
-
-                    // Nothing ambiguous — skip the API call entirely
-                    guard !ambiguous.isEmpty else {
-                        self.isAIEnhancing = false
-                        return
-                    }
+                // Send all found items to AI (capped at 30 to stay within token limits)
+                if let key = apiKey, !key.isEmpty, !sorted.isEmpty {
+                    let itemsForAI = Array(sorted.prefix(30))
 
                     self.isAIEnhancing = true
                     self.ai.enhance(
-                        items:   ambiguous,
+                        items:   itemsForAI,
                         rootURL: rootURL,
                         apiKey:  key
                     ) { [weak self] enhanced, summary in
                         guard let self else { return }
-                        // Merge AI-enhanced ambiguous items back with
-                        // the untouched safe items from the rule engine
-                        let ambiguousPaths = Set(ambiguous.map { $0.url.path })
-                        let untouched = sorted.filter { !ambiguousPaths.contains($0.url.path) }
-                        let merged = (untouched + enhanced).sorted {
+                        let aiPaths   = Set(itemsForAI.map { $0.url.path })
+                        let untouched = sorted.filter { !aiPaths.contains($0.url.path) }
+                        let merged    = (untouched + enhanced).sorted {
                             if $0.safety != $1.safety { return $0.safety < $1.safety }
                             return $0.size > $1.size
                         }
-                        let newAutoStaged = merged.filter { $0.safety == .safe }
-                        self.suggestions   = merged
-                        self.staged        = newAutoStaged
-                        self.aiSummary     = summary
-                        self.isAIEnhancing = false
+                        let newAutoStaged    = merged.filter { $0.safety == .safe }
+                        self.suggestions     = merged
+                        self.staged          = newAutoStaged
+                        self.aiSummary       = summary
+                        self.isAIEnhancing   = false
                     }
                 }
             }

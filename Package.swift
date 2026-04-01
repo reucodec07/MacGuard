@@ -8,6 +8,10 @@ let package = Package(
         .executableTarget(
             name: "MacGuard",
             path: "Sources/MacGuard"
+        ),
+        .testTarget(
+            name: "MacGuardTests",
+            dependencies: ["MacGuard"]
         )
     ]
 )

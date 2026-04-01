@@ -33,15 +33,20 @@ enum LoginItemFilter: String, CaseIterable {
 // MARK: — Main View
 
 struct LoginItemsView: View {
-    @StateObject private var manager      = LoginItemsManager()
-    @State private var filter:  LoginItemFilter = .all
-    @State private var search             = ""
-    @State private var selected: LoginItem?
+    @State private var searchText = ""
+    @StateObject private var manager = LoginItemsManager()
+    @State private var filter: LoginItemFilter = .all
+    @State private var multiSelection = Set<LoginItem>()
+    @State private var selectedItem: LoginItem? = nil
+    @State private var isInspectorPresented = false
+    
+    // Toast & Banner states
+    @State private var toastMessage = ""
+    @State private var toastStyle: ToastStyle = .success
+    @State private var showToast = false
+    
     @State private var pendingToggle: LoginItem?
     @State private var pendingRemove: LoginItem?
-    @State private var resultMsg          = ""
-    @State private var resultOK           = true
-    @State private var showResult         = false
 
     var filtered: [LoginItem] {
         let base: [LoginItem]
@@ -52,8 +57,8 @@ struct LoginItemsView: View {
         case .loginItems: base = manager.items.filter { [.loginItem, .backgroundItem].contains($0.type) }
         case .disabled:   base = manager.items.filter { !$0.isEnabled }
         }
-        guard !search.isEmpty else { return base }
-        let q = search.lowercased()
+        guard !searchText.isEmpty else { return base }
+        let q = searchText.lowercased()
         return base.filter {
             $0.displayName.lowercased().contains(q)  ||
             $0.identifier.lowercased().contains(q)   ||
@@ -61,225 +66,352 @@ struct LoginItemsView: View {
         }
     }
 
-    func count(_ f: LoginItemFilter) -> Int {
-        switch f {
-        case .all:        return manager.items.count
-        case .daemons:    return manager.items.filter { $0.type == .launchDaemon }.count
-        case .agents:     return manager.items.filter { $0.type == .launchAgent  }.count
-        case .loginItems: return manager.items.filter { [.loginItem, .backgroundItem].contains($0.type) }.count
-        case .disabled:   return manager.items.filter { !$0.isEnabled }.count
-        }
-    }
-
     var body: some View {
-        HSplitView {
-            sidebar
-                .frame(minWidth: 160, idealWidth: 175, maxWidth: 195)
-            content
+        ZStack {
+            HStack(spacing: 0) {
+                sidebar
+                
+                VStack(spacing: 0) {
+                    toolbar
+                    
+                    if manager.needsFDA && !manager.isLoading {
+                        fdaBanner.padding(12)
+                    }
+                    
+                    mainList
+                    
+                    if !multiSelection.isEmpty {
+                        batchActionsBar
+                    }
+                }
+                .background(Color(NSColor.windowBackgroundColor))
+                
+                InspectorPane(title: "Item Details", isPresented: $isInspectorPresented) {
+                    Group {
+                        if let item = selectedItem {
+                            LoginItemInspector(item: item)
+                        } else {
+                            Color.clear
+                        }
+                    }
+                }
+            }
+            
+            ToastView(message: toastMessage, style: toastStyle, isPresented: $showToast)
         }
         .onAppear {
-            // Only load once — onAppear fires on every tab switch in TabView
             if manager.items.isEmpty && !manager.isLoading { manager.refresh() }
-            AdminSession.shared.warmUp { _ in }
-        }
-        .alert(resultOK ? "Done" : "Error", isPresented: $showResult) {
-            Button("OK", role: .cancel) {}
-        } message: { Text(resultMsg) }
-        // Disable confirmation
-        .confirmationDialog(
-            "Disable \(pendingToggle?.displayName ?? "")?",
-            isPresented: Binding(
-                get: { pendingToggle != nil },
-                set: { if !$0 { pendingToggle = nil } }
-            ), titleVisibility: .visible
-        ) {
-            if let item = pendingToggle {
-                Button("Disable", role: .destructive) {
-                    manager.toggle(item) { ok, msg in
-                        resultOK = ok; resultMsg = msg; showResult = true
-                    }
-                    pendingToggle = nil
-                }
-                Button("Cancel", role: .cancel) { pendingToggle = nil }
-            }
-        } message: {
-            if let item = pendingToggle {
-                Text("Disabling \(item.displayName) stops it from running at startup. You can re-enable it at any time.\(item.type.requiresAdmin ? "\n\n🔐 Your admin password will be required." : "")")
-            }
-        }
-        // Remove confirmation
-        .confirmationDialog(
-            "Remove \(pendingRemove?.displayName ?? "")?",
-            isPresented: Binding(
-                get: { pendingRemove != nil },
-                set: { if !$0 { pendingRemove = nil } }
-            ), titleVisibility: .visible
-        ) {
-            if let item = pendingRemove {
-                Button("Remove Permanently", role: .destructive) {
-                    manager.remove(item) { ok, msg in
-                        resultOK = ok; resultMsg = msg; showResult = true
-                    }
-                    pendingRemove = nil
-                }
-                Button("Cancel", role: .cancel) { pendingRemove = nil }
-            }
-        } message: {
-            if let item = pendingRemove {
-                Text("This permanently deletes \(item.plistFileName). The service will no longer start at login.\(item.type.requiresAdmin ? "\n\n🔐 Your admin password will be required." : "")")
-            }
         }
     }
 
-    // MARK: — Sidebar
-    var sidebar: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("Filter")
-                .font(.caption).fontWeight(.semibold)
+    private func showFeedback(_ msg: String, success: Bool) {
+        toastMessage = msg
+        toastStyle = success ? .success : .error
+        withAnimation { showToast = true }
+    }
+
+    // MARK: - Components
+
+    private var sidebar: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("TYPES")
+                .font(.system(size: 10, weight: .bold))
                 .foregroundColor(.secondary)
-                .padding(.horizontal, 10)
-                .padding(.top, 10)
+                .padding(.horizontal, 16)
+                .padding(.top, 20)
+                .padding(.bottom, 4)
 
             ForEach(LoginItemFilter.allCases, id: \.self) { f in
-                FilterRow(
-                    label: f.rawValue,
-                    icon:  f.icon,
-                    color: f.color,
-                    count: count(f),
-                    isSelected: filter == f
-                )
-                .onTapGesture { filter = f }
+                SidebarRow(filter: f, current: filter, count: manager.count(f)) {
+                    filter = f
+                }
             }
 
             Spacer()
-
+            
             if manager.isLoading {
-                HStack { Spacer(); ProgressView().scaleEffect(0.65); Spacer() }
-                    .padding(.bottom, 10)
+                ProgressView().controlSize(.small).padding(16)
             }
+        }
+        .frame(width: 200)
+        .background(.thinMaterial)
+        .overlay(Rectangle().fill(Color.primary.opacity(0.1)).frame(width: 1), alignment: .trailing)
+    }
+
+    private var toolbar: some View {
+        HStack {
+            Picker("", selection: $filter) {
+                ForEach(LoginItemFilter.allCases, id: \.self) { f in
+                    Text(f.rawValue).tag(f)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 200)
+            
+            TextField("Search Login Items...", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 180)
+            
+            Spacer()
+            
+            Button { manager.refresh() } label: {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.bordered)
+            .disabled(manager.isLoading)
+        }
+        .padding(12)
+        .background(.regularMaterial)
+    }
+
+    private var mainList: some View {
+        List(filtered, selection: $multiSelection) { item in
+            LoginItemRow(item: item) {
+                selectedItem = item
+                isInspectorPresented = true
+            } onToggle: {
+                if item.isEnabled { pendingToggle = item }
+                else {
+                    manager.toggle(item) { ok, msg in showFeedback(msg, success: ok) }
+                }
+            }
+            .contextMenu {
+                contextMenu(for: item)
+            }
+            .tag(item)
+        }
+        .listStyle(.inset)
+    }
+
+    private var batchActionsBar: some View {
+        HStack {
+            Text("\(multiSelection.count) items selected")
+                .font(.system(size: 12, weight: .medium))
+            Spacer()
+            Button("Disable Non-Apple") {
+                manager.disableAllNonApple { count in
+                    showFeedback("Disabled \(count) items", success: true)
+                }
+            }
+            .buttonStyle(.bordered)
+            Button("Export Selected") {
+                manager.exportItems() // Simplified for now
+            }
+            .buttonStyle(.bordered)
+            Button("Clear Selection") {
+                multiSelection.removeAll()
+            }
+            .buttonStyle(.plain)
+            .foregroundColor(.accentColor)
+        }
+        .padding(12)
+        .background(.ultraThinMaterial)
+        .overlay(Rectangle().fill(Color.primary.opacity(0.1)).frame(height: 1), alignment: .top)
+    }
+
+    private var fdaBanner: some View {
+        BannerView(
+            title: "Full Disk Access Required",
+            subtitle: "Grant access to see background items from all users.",
+            style: .warning,
+            actionLabel: "Open Settings",
+            action: {
+                NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
+            }
+        )
+    }
+
+    private func contextMenu(for item: LoginItem) -> some View {
+        Group {
+            Button("Inspect Details") {
+                selectedItem = item
+                withAnimation { isInspectorPresented = true }
+            }
+            Divider()
+            Button("Reveal in Finder") { manager.revealInFinder(item) }
+            if item.associatedApp != nil {
+                Button("Reveal App in Finder") { manager.revealAppInFinder(item) }
+            }
+            Divider()
+            Button("Remove...") { pendingRemove = item }
+        }
+    }
+}
+
+// MARK: - Subviews
+
+struct SidebarRow: View {
+    let filter: LoginItemFilter
+    let current: LoginItemFilter
+    let count: Int
+    let action: () -> Void
+    
+    var isSelected: Bool { filter == current }
+    
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: filter.icon)
+                .foregroundColor(isSelected ? .accentColor : filter.color)
+                .frame(width: 16)
+            Text(filter.rawValue)
+                .font(.system(size: 13, weight: isSelected ? .semibold : .regular))
+            Spacer()
+            if count > 0 {
+                Text("\(count)")
+                    .font(.system(size: 10, weight: .medium))
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(Color.primary.opacity(0.05))
+                    .cornerRadius(10)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(isSelected ? Color.accentColor.opacity(0.1) : Color.clear)
+        .cornerRadius(8)
+        .padding(.horizontal, 8)
+        .contentShape(Rectangle())
+        .onTapGesture(perform: action)
+    }
+}
+
+struct LoginItemRow: View {
+    let item: LoginItem
+    let onSelect: () -> Void
+    let onToggle: () -> Void
+    @State private var hovered = false
+    
+    var body: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(item.type.color.opacity(0.1))
+                    .frame(width: 40, height: 40)
+                if let appURL = item.associatedApp {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                        .resizable().scaledToFit().frame(width: 30, height: 30)
+                } else {
+                    Image(systemName: item.type.icon).foregroundColor(item.type.color)
+                }
+            }
+            
+            VStack(alignment: .leading, spacing: 2) {
+                HStack {
+                    Text(item.displayName).fontWeight(.medium)
+                    if item.type.requiresAdmin {
+                        Image(systemName: "lock.fill").font(.system(size: 9)).foregroundColor(.secondary)
+                    }
+                }
+                Text(item.identifier).font(.caption).foregroundColor(.secondary).lineLimit(1)
+            }
+            
+            Spacer()
+            
+            if hovered {
+                Button(action: onSelect) {
+                    Image(systemName: "info.circle")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            
+            Toggle("", isOn: Binding(get: { item.isEnabled }, set: { _ in onToggle() }))
+                .toggleStyle(.switch).controlSize(.small)
         }
         .padding(.vertical, 4)
-        .background(Color(NSColor.windowBackgroundColor))
+        .onHover { hovered = $0 }
     }
+}
 
-    // MARK: — Content
-    var content: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            // Toolbar
-            HStack(spacing: 8) {
-                TextField("Search name, identifier, developer…", text: $search)
-                    .textFieldStyle(.roundedBorder)
-                Button { manager.refresh() } label: {
-                    Image(systemName: "arrow.clockwise")
+struct LoginItemInspector: View {
+    let item: LoginItem
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            header
+            
+            Section(header: Text("Details").font(.caption.bold())) {
+                VStack(alignment: .leading, spacing: 10) {
+                    InfoRow(label: "Identifier", value: item.identifier)
+                    InfoRow(label: "Type", value: item.type.displayName)
+                    InfoRow(label: "Scope", value: item.startupScope)
                 }
-                .buttonStyle(.bordered)
-                .disabled(manager.isLoading)
-                Button { manager.openSystemSettings() } label: {
-                    Image(systemName: "gear")
-                }
-                .buttonStyle(.bordered)
-                .help("Open System Settings → Login Items")
             }
-            .padding([.horizontal, .top], 12)
-            .padding(.bottom, 6)
-
-            // FDA warning banner
-            if manager.needsFDA && !manager.isLoading {
-                VStack(alignment: .leading, spacing: 8) {
-                    HStack(spacing: 8) {
-                        Image(systemName: "lock.shield").foregroundColor(.orange)
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text("Full Disk Access required for complete results")
-                                .font(.system(size: 12, weight: .medium))
-                            Text("Go to System Settings → Privacy & Security → Full Disk Access → enable MacGuard")
-                                .font(.caption).foregroundColor(.secondary)
-                        }
-                        Spacer()
-                        Button("Open Settings") {
-                            NSWorkspace.shared.open(URL(string:
-                                "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")!)
-                        }
-                        .buttonStyle(.bordered).controlSize(.small)
-                    }
-                    // MacGuard runs in the menu bar — closing the window does NOT quit the
-                    // process. Full Disk Access only takes effect on a fresh launch.
-                    // The Relaunch button terminates and reopens the app properly.
-                    HStack(spacing: 6) {
-                        Image(systemName: "info.circle").foregroundColor(.orange).font(.system(size: 11))
-                        Text("After granting access, you must fully relaunch MacGuard — closing the window is not enough.")
-                            .font(.caption).foregroundColor(.secondary)
-                        Spacer()
-                        Button("Relaunch Now") {
-                            let url = Bundle.main.bundleURL
-                            let cfg = NSWorkspace.OpenConfiguration()
-                            NSWorkspace.shared.openApplication(at: url, configuration: cfg) { _, _ in }
-                            NSApp.terminate(nil)
-                        }
-                        .buttonStyle(.borderedProminent).tint(.orange).controlSize(.small)
+            
+            if !item.developerName.isEmpty {
+                Section(header: Text("Developer").font(.caption.bold())) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        InfoRow(label: "Name", value: item.developerName)
+                        InfoRow(label: "Team ID", value: item.developerID)
                     }
                 }
-                .padding(10)
-                .background(Color.orange.opacity(0.08))
-                .cornerRadius(8)
-                .padding(.horizontal, 12)
-                .padding(.bottom, 6)
             }
-
-            // Status bar
-            if !manager.statusMessage.isEmpty {
-                Text(manager.statusMessage)
-                    .font(.caption).foregroundColor(.secondary)
-                    .padding(.horizontal, 12).padding(.bottom, 4)
+            
+            if let plist = item.plistURL {
+                Section(header: Text("Location").font(.caption.bold())) {
+                    Text(plist.path)
+                        .font(.system(size: 10, design: .monospaced))
+                        .foregroundColor(.secondary)
+                        .padding(8)
+                        .background(Color.primary.opacity(0.05))
+                        .cornerRadius(6)
+                }
             }
-
-            Divider()
-
-            // List
-            if manager.isLoading {
-                Spacer()
-                HStack { Spacer()
-                    VStack(spacing: 10) {
-                        ProgressView()
-                        Text("Reading background tasks…").foregroundColor(.secondary)
-                    }
-                    Spacer()
+            
+            Spacer()
+        }
+    }
+    
+    private var header: some View {
+        HStack(spacing: 12) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 12)
+                    .fill(item.type.color.opacity(0.1))
+                    .frame(width: 56, height: 56)
+                if let appURL = item.associatedApp {
+                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
+                        .resizable().scaledToFit().frame(width: 40, height: 40)
+                } else {
+                    Image(systemName: item.type.icon).font(.system(size: 24)).foregroundColor(item.type.color)
                 }
-                Spacer()
-            } else if filtered.isEmpty {
-                Spacer()
-                HStack { Spacer()
-                    VStack(spacing: 8) {
-                        Image(systemName: "tray")
-                            .font(.system(size: 40)).foregroundColor(.secondary.opacity(0.35))
-                        Text(search.isEmpty
-                            ? "No items in this category"
-                            : "No results for \"\(search)\"")
-                            .foregroundColor(.secondary)
-                    }
-                    Spacer()
-                }
-                Spacer()
-            } else {
-                List(filtered, id: \.id, selection: $selected) { item in
-                    LoginItemRow(
-                        item:     item,
-                        onToggle: {
-                            if item.isEnabled { pendingToggle = item }
-                            else {
-                                manager.toggle(item) { ok, msg in
-                                    resultOK = ok; resultMsg = msg; showResult = true
-                                }
-                            }
-                        },
-                        onReveal: { manager.revealInFinder(item)  },
-                        onRemove: { pendingRemove = item          }
-                    )
-                    .tag(item)
-                }
-                .listStyle(.bordered)
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text(item.displayName).font(.headline)
+                Text(item.isEnabled ? "Enabled" : "Disabled")
+                    .font(.caption.bold())
+                    .foregroundColor(item.isEnabled ? item.type.color : .secondary)
             }
         }
     }
+}
+
+struct InfoRow: View {
+    let label: String
+    let value: String
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.system(size: 9, weight: .bold)).foregroundColor(.secondary)
+            Text(value).font(.system(size: 11)).foregroundColor(.primary).textSelection(.enabled)
+        }
+    }
+}
+
+extension LoginItemsManager {
+    func count(_ f: LoginItemFilter) -> Int {
+        switch f {
+        case .all:        return items.count
+        case .daemons:    return items.filter { $0.type == .launchDaemon }.count
+        case .agents:     return items.filter { $0.type == .launchAgent  }.count
+        case .loginItems: return items.filter { [.loginItem, .backgroundItem].contains($0.type) }.count
+        case .disabled:   return items.filter { !$0.isEnabled }.count
+        }
+    }
+}
+
+#Preview {
+    LoginItemsView()
+        .frame(width: 800, height: 600)
 }
 
 // MARK: — Filter Row
@@ -313,121 +445,5 @@ struct FilterRow: View {
         .cornerRadius(6)
         .padding(.horizontal, 6)
         .contentShape(Rectangle())
-    }
-}
-
-// MARK: — Item Row
-struct LoginItemRow: View {
-    let item:     LoginItem
-    let onToggle: () -> Void
-    let onReveal: () -> Void
-    let onRemove: () -> Void
-
-    @State private var hovered = false
-
-    var body: some View {
-        HStack(spacing: 12) {
-            // Icon
-            ZStack {
-                RoundedRectangle(cornerRadius: 8)
-                    .fill(item.type.color.opacity(0.1))
-                    .frame(width: 42, height: 42)
-                if let appURL = item.associatedApp {
-                    Image(nsImage: NSWorkspace.shared.icon(forFile: appURL.path))
-                        .resizable().scaledToFit()
-                        .frame(width: 32, height: 32)
-                        .cornerRadius(6)
-                } else {
-                    Image(systemName: item.type.icon)
-                        .font(.system(size: 18))
-                        .foregroundColor(item.type.color)
-                }
-            }
-
-            // Text info
-            VStack(alignment: .leading, spacing: 3) {
-                HStack(spacing: 6) {
-                    Text(item.displayName)
-                        .fontWeight(.medium)
-                        .foregroundColor(item.isEnabled ? .primary : .secondary)
-                    // Type badge
-                    Text(item.type.displayName.uppercased())
-                        .font(.system(size: 8, weight: .bold))
-                        .foregroundColor(.white)
-                        .padding(.horizontal, 4).padding(.vertical, 2)
-                        .background(item.type.color)
-                        .cornerRadius(3)
-                    // Admin badge
-                    if item.type.requiresAdmin {
-                        Image(systemName: "lock.fill")
-                            .font(.system(size: 9))
-                            .foregroundColor(.red.opacity(0.7))
-                            .help("Requires admin password to toggle")
-                    }
-                }
-                Text(item.identifier)
-                    .font(.caption).foregroundColor(.secondary).lineLimit(1)
-                HStack(spacing: 8) {
-                    Text(item.startupScope)
-                        .font(.caption2).foregroundColor(.secondary.opacity(0.8))
-                    if !item.developerName.isEmpty {
-                        Text("•").font(.caption2).foregroundColor(.secondary.opacity(0.5))
-                        Text(item.developerName)
-                            .font(.caption2).foregroundColor(.secondary.opacity(0.8))
-                    }
-                }
-            }
-
-            Spacer()
-
-            // Hover actions
-            if hovered {
-                HStack(spacing: 4) {
-                    MiniButton("folder",    "Reveal in Finder",   .secondary, onReveal)
-                    MiniButton("trash",     "Remove plist",       .red,       onRemove)
-                }
-                .transition(.opacity)
-            }
-
-            // Toggle
-            VStack(alignment: .trailing, spacing: 3) {
-                Toggle("", isOn: Binding(
-                    get: { item.isEnabled },
-                    set: { _ in onToggle() }
-                ))
-                .toggleStyle(.switch)
-                .controlSize(.small)
-                .tint(item.type.color)
-                Text(item.isEnabled ? "Enabled" : "Disabled")
-                    .font(.caption2)
-                    .foregroundColor(item.isEnabled ? item.type.color : .secondary)
-            }
-        }
-        .padding(.vertical, 5)
-        .contentShape(Rectangle())
-        .onHover { hovered = $0 }
-        .animation(.easeInOut(duration: 0.12), value: hovered)
-    }
-}
-
-struct MiniButton: View {
-    let icon:    String
-    let tooltip: String
-    let color:   Color
-    let action:  () -> Void
-    init(_ icon: String, _ tooltip: String, _ color: Color, _ action: @escaping () -> Void) {
-        self.icon = icon; self.tooltip = tooltip
-        self.color = color; self.action = action
-    }
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 12)).foregroundColor(color)
-                .frame(width: 26, height: 26)
-                .background(color.opacity(0.1))
-                .cornerRadius(5)
-        }
-        .buttonStyle(.plain)
-        .help(tooltip)
     }
 }

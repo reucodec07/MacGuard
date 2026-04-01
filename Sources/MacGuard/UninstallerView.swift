@@ -1,8 +1,8 @@
 import SwiftUI
 
 struct UninstallerView: View {
+    @State private var searchText = ""
     @StateObject private var uninstaller = AppUninstaller()
-    @State private var searchText        = ""
     @State private var showConfirm       = false
     @State private var selectedID: UUID?
     @State private var resultMessage     = ""
@@ -27,7 +27,8 @@ struct UninstallerView: View {
                     if uninstaller.isScanning { ProgressView().scaleEffect(0.7) }
                     Button("↻ Scan") { uninstaller.scanApps() }.buttonStyle(.bordered)
                 }
-                TextField("Search name or bundle ID…", text: $searchText)
+                
+                TextField("Search Apps...", text: $searchText)
                     .textFieldStyle(.roundedBorder)
                 if !uninstaller.statusMessage.isEmpty && !uninstaller.isScanning {
                     Text(uninstaller.statusMessage)
@@ -126,21 +127,27 @@ struct UninstallerView: View {
             if !uninstaller.isFindingFiles {
                 if uninstaller.launchSvcCount() > 0 {
                     BannerView(
-                        icon: "gearshape.2.fill", color: .blue,
                         title: "\(uninstaller.launchSvcCount()) background service(s) will be unloaded first",
-                        detail: "MacGuard will run launchctl to stop them before deleting their plist files — this prevents re-spawning")
+                        subtitle: "MacGuard will run launchctl to stop them before deleting their plist files — this prevents re-spawning",
+                        style: .info,
+                        actionLabel: nil,
+                        action: nil)
                 }
                 if uninstaller.adminFileCount() > 0 {
                     BannerView(
-                        icon: "lock.shield.fill", color: .orange,
                         title: "\(uninstaller.adminFileCount()) system file(s) require your admin password",
-                        detail: "One password prompt will handle all of them at once")
+                        subtitle: "One password prompt will handle all of them at once",
+                        style: .warning,
+                        actionLabel: nil,
+                        action: nil)
                 }
                 if uninstaller.sipFileCount() > 0 {
                     BannerView(
-                        icon: "shield.slash.fill", color: .red,
                         title: "\(uninstaller.sipFileCount()) SIP-protected file(s) cannot be deleted",
-                        detail: "These are owned by macOS SIP and cannot be removed by any app. They take no storage worth reclaiming.")
+                        subtitle: "These are owned by macOS SIP and cannot be removed by any app. They take no storage worth reclaiming.",
+                        style: .critical,
+                        actionLabel: nil,
+                        action: nil)
                 }
             }
 
@@ -334,27 +341,5 @@ struct UninstallerView: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-}
-
-// Reusable warning banner
-struct BannerView: View {
-    let icon: String
-    let color: Color
-    let title: String
-    let detail: String
-    var body: some View {
-        HStack(spacing: 8) {
-            Image(systemName: icon).foregroundColor(color)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title).font(.system(size: 12, weight: .medium))
-                Text(detail).font(.caption).foregroundColor(.secondary)
-            }
-            Spacer()
-        }
-        .padding(10)
-        .background(color.opacity(0.08))
-        .cornerRadius(8)
-        .padding(.horizontal)
     }
 }

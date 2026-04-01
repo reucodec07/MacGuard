@@ -12,7 +12,7 @@ enum FileDeletability {
 }
 
 struct PreflightIssue {
-    enum Severity { case blocker, warning }
+    enum Severity { case blocker, warning, info }
     let severity: Severity
     let icon:     String
     let title:    String
@@ -68,6 +68,7 @@ struct RelatedFile: Identifiable {
 
 // MARK: — AppUninstaller
 
+@MainActor
 class AppUninstaller: ObservableObject {
     @Published var installedApps:         [AppBundle]      = []
     @Published var relatedFiles:          [RelatedFile]    = []
@@ -127,7 +128,7 @@ class AppUninstaller: ObservableObject {
         "/Library/Security/SecurityAgentPlugins",
     ]
 
-    private var lsregisterPath: String {
+    nonisolated private var lsregisterPath: String {
         [
             "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
             "/System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister"
@@ -138,7 +139,7 @@ class AppUninstaller: ObservableObject {
     // SecTranslocateCreateOriginalPathForURL is explicitly unsupported for third-party use.
     // We use realpath() which resolves the bind-mount macOS uses for translocation,
     // with a quarantine xattr parse as a diagnostic fallback.
-    private func resolveTranslocation(_ url: URL) -> (resolved: URL, isTranslocated: Bool) {
+    nonisolated private func resolveTranslocation(_ url: URL) -> (resolved: URL, isTranslocated: Bool) {
         var buf = [CChar](repeating: 0, count: Int(PATH_MAX))
         if realpath(url.path, &buf) != nil {
             let resolved = URL(fileURLWithPath: String(cString: buf))
@@ -152,17 +153,14 @@ class AppUninstaller: ObservableObject {
     }
 
     // MARK: — Read-only volume check
-    // Uses statfs() — single syscall, no subprocess (fixes diskutil performance bug)
-    private func isOnReadOnlyVolume(_ url: URL) -> Bool {
-        // Avoid Darwin.statfs prefix — Swift conflates the struct type and function name
+    // statfs() is a fast syscall compared to invoking `diskutil info`
+    nonisolated private func isOnReadOnlyVolume(_ url: URL) -> Bool {
         var st = statfs()
         guard statfs(url.path, &st) == 0 else { return false }
         return (st.f_flags & UInt32(MNT_RDONLY)) != 0
     }
 
-    // MARK: — File metadata via lstat (doesn't follow symlinks)
-    // Returns (isSymlink, hardLinkCount, exists) in one syscall
-    private func lstatInfo(_ url: URL) -> (exists: Bool, isSymlink: Bool, nlink: Int) {
+    nonisolated private func lstatInfo(_ url: URL) -> (exists: Bool, isSymlink: Bool, nlink: Int) {
         var st = Darwin.stat()
         guard lstat(url.path, &st) == 0 else { return (false, false, 0) }
         let isLink = (st.st_mode & S_IFMT) == S_IFLNK
@@ -178,12 +176,12 @@ class AppUninstaller: ObservableObject {
 
     // MARK: — Shared lib cross-reference
     // Only called for files under sharedLibPaths — cached to avoid N subprocess spawns
-    private func isSharedByOtherPackages(_ url: URL, appBundleID: String) -> Bool {
+    private func isSharedByOtherPackages(_ url: URL, appBundleID: String) async -> Bool {
         let path = url.path
         guard sharedLibPaths.contains(where: { path.hasPrefix($0) }) else { return false }
         if let cached = sharedFileCache[path] { return cached }
 
-        let info      = runCmd("/usr/sbin/pkgutil", ["--file-info", path])
+        let info      = await ProcessRunner.shared.run("/usr/sbin/pkgutil", ["--file-info", path]).stdout
         let pkgLines  = info.components(separatedBy: "\n").filter { $0.contains("pkgid:") }
         var isShared  = pkgLines.count > 1
 
@@ -193,7 +191,7 @@ class AppUninstaller: ObservableObject {
             let terms = appBundleID.lowercased().components(separatedBy: ".")
             isShared  = !terms.contains(where: { owner.lowercased().contains($0) })
         }
-        sharedFileCache[path] = isShared
+        await MainActor.run { sharedFileCache[path] = isShared }
         return isShared
     }
 
@@ -213,7 +211,7 @@ class AppUninstaller: ObservableObject {
 
     // MARK: — Search terms
     // stopWords does NOT include "helper"/"daemon"/"agent" — they identify the app
-    private func buildTerms(for app: AppBundle) -> Set<String> {
+    nonisolated private func buildTerms(for app: AppBundle) -> Set<String> {
         let stopWords: Set<String> = [
             "com", "app", "the", "inc", "ltd", "org", "net",
             "co", "io", "dev", "mac", "apple", "microsoft", "google", "adobe"
@@ -223,7 +221,6 @@ class AppUninstaller: ObservableObject {
             .map    { $0.lowercased() }
             .filter { $0.count > 2 && !stopWords.contains($0) }
         return Set([app.name.lowercased(), app.bundleID.lowercased()] + bidParts)
-            .filter { $0.count > 2 }
     }
 
     // MARK: — Scan installed apps
@@ -233,7 +230,7 @@ class AppUninstaller: ObservableObject {
         statusMessage = "Scanning applications…"
         sharedFileCache = [:]
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             let fm   = FileManager.default
             let home = fm.homeDirectoryForCurrentUser.path
@@ -269,7 +266,7 @@ class AppUninstaller: ObservableObject {
             }
 
             let sorted = apps.sorted { $0.name.lowercased() < $1.name.lowercased() }
-            DispatchQueue.main.async {
+            await MainActor.run {
                 self.installedApps  = sorted
                 self.isScanning     = false
                 self.statusMessage  = "\(sorted.count) apps found"
@@ -278,7 +275,7 @@ class AppUninstaller: ObservableObject {
     }
 
     // MARK: — Pre-flight checks
-    func runPreflightChecks(for app: AppBundle) {
+    func runPreflightChecks(for app: AppBundle) async {
         var issues = [PreflightIssue]()
         let fm = FileManager.default
 
@@ -304,7 +301,7 @@ class AppUninstaller: ObservableObject {
         }
 
         // APFS local snapshots
-        let snaps = runCmd("/usr/bin/tmutil", ["listlocalsnapshots", "/"])
+        let snaps = await ProcessRunner.shared.run("/usr/bin/tmutil", ["listlocalsnapshots", "/"]).stdout
         if !snaps.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             issues.append(.init(
                 severity: .warning, icon: "clock.arrow.circlepath",
@@ -338,7 +335,7 @@ class AppUninstaller: ObservableObject {
                 detail: "Deleting one path frees nothing until all links are gone: \(names)"))
         }
 
-        DispatchQueue.main.async { self.preflightIssues = issues }
+        await MainActor.run { self.preflightIssues = issues }
     }
 
     // MARK: — Deep scan
@@ -350,7 +347,7 @@ class AppUninstaller: ObservableObject {
         statusMessage        = "Running deep scan…"
         sharedFileCache      = [:]
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             let fm    = FileManager.default
             let home  = fm.homeDirectoryForCurrentUser.path
@@ -369,82 +366,60 @@ class AppUninstaller: ObservableObject {
             var found    = [RelatedFile]()
             var warnings = [String]()
 
-            func add(_ url: URL, source: String) {
-                let path     = url.path
-                let lastName = url.lastPathComponent.lowercased()
-
-                // lstat: single syscall for existence + symlink + nlink — no subprocess
-                let (exists, isLink, nlink) = self.lstatInfo(url)
-                guard exists,
-                      !seen.contains(path),
-                      !path.hasPrefix(scanBase.path),
-                      !self.sharedDirs.contains(path),
-                      terms.contains(where: { lastName.contains($0) }) else { return }
-
-                // Cross-reference for shared lib paths only (cached after first hit)
-                if self.isSharedByOtherPackages(url, appBundleID: app.bundleID) {
-                    warnings.append("⚠️ Shared lib skipped (other apps use it): \(url.lastPathComponent)")
-                    return
-                }
-
-                let isCloud = self.isICloudEvicted(url)
-                if isCloud {
-                    warnings.append("☁️ iCloud evicted placeholder: \(url.lastPathComponent) — delete from iCloud.com or re-download first")
-                }
-
-                seen.insert(path)
-                found.append(RelatedFile(
-                    url:             url,
-                    size:            self.sizeOf(url: url),
-                    source:          source,
-                    deletability:    self.classify(url),
-                    isSymlink:       isLink,
-                    hardLinkCount:   nlink,
-                    isICloudEvicted: isCloud
-                ))
-            }
-
-            // Layer 1: mdfind
+            // Cross reference can be awaited inside add
             for q in ["kMDItemCFBundleIdentifier == '\(app.bundleID)'",
                       "kMDItemBundleIdentifier == '\(app.bundleID)'"] {
-                self.runCmd("/usr/bin/mdfind", [q]).lines
-                    .forEach { add(URL(fileURLWithPath: $0), source: "Spotlight") }
+                let stdout = await ProcessRunner.shared.run("/usr/bin/mdfind", [q]).stdout
+                for p in stdout.lines {
+                    let u = URL(fileURLWithPath: p)
+                    await self.processCandidate(u, source: "Spotlight", app: app, terms: terms, seen: &seen, warnings: &warnings, found: &found)
+                }
             }
+            
             for basePath in ["\(home)/Library", "/Library"] {
-                self.runCmd("/usr/bin/mdfind", ["-onlyin", basePath, "-name", app.name]).lines
-                    .forEach { add(URL(fileURLWithPath: $0), source: "Spotlight") }
+                let stdout = await ProcessRunner.shared.run("/usr/bin/mdfind", ["-onlyin", basePath, "-name", app.name]).stdout
+                for p in stdout.lines {
+                    let u = URL(fileURLWithPath: p)
+                    await self.processCandidate(u, source: "Spotlight", app: app, terms: terms, seen: &seen, warnings: &warnings, found: &found)
+                }
             }
 
             // Layer 2: pkgutil receipts
-            let pkgIDs = self.runCmd("/usr/sbin/pkgutil",
-                ["--pkgs=.*\(terms.sorted().first ?? app.name.lowercased()).*"]).lines
+            let pkgOut = await ProcessRunner.shared.run("/usr/sbin/pkgutil", ["--pkgs=.*\(terms.sorted().first ?? app.name.lowercased()).*"]).stdout
+            let pkgIDs = pkgOut.lines
             for pkgID in pkgIDs {
-                self.runCmd("/usr/sbin/pkgutil", ["--files", pkgID]).lines
-                    .map    { URL(fileURLWithPath: "/\($0)") }
-                    .filter { !self.sharedDirs.contains($0.path) }
-                    .forEach { add($0, source: "Package (\(pkgID))") }
+                let pkgFiles = await ProcessRunner.shared.run("/usr/sbin/pkgutil", ["--files", pkgID]).stdout.lines
+                for p in pkgFiles {
+                    let u = URL(fileURLWithPath: "/\(p)")
+                    if !self.sharedDirs.contains(u.path) {
+                        await self.processCandidate(u, source: "Package (\(pkgID))", app: app, terms: terms, seen: &seen, warnings: &warnings, found: &found)
+                    }
+                }
             }
 
             // Layer 3: directory scan
             for loc in self.userLocations {
                 let dir = URL(fileURLWithPath: "\(home)/\(loc)")
-                (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?
-                    .forEach { add($0, source: "~/Library") }
+                if let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                    for u in items { await self.processCandidate(u, source: "~/Library", app: app, terms: terms, seen: &seen, warnings: &warnings, found: &found) }
+                }
             }
             for loc in self.systemLocations {
                 let dir = URL(fileURLWithPath: loc)
-                (try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil))?
-                    .forEach { add($0, source: "/Library") }
+                if let items = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil) {
+                    for u in items { await self.processCandidate(u, source: "/Library", app: app, terms: terms, seen: &seen, warnings: &warnings, found: &found) }
+                }
             }
 
             // Layer 4: /private/var/folders
-            self.runCmd("/usr/bin/mdfind",
-                ["-onlyin", "/private/var/folders", app.bundleID]).lines
-                .forEach { add(URL(fileURLWithPath: $0), source: "Temp Cache") }
+            let varOut = await ProcessRunner.shared.run("/usr/bin/mdfind", ["-onlyin", "/private/var/folders", app.bundleID]).stdout
+            for p in varOut.lines {
+                let u = URL(fileURLWithPath: p)
+                await self.processCandidate(u, source: "Temp Cache", app: app, terms: terms, seen: &seen, warnings: &warnings, found: &found)
+            }
 
             // Advisory checks
-            let netPlist = URL(fileURLWithPath:
-                "/Library/Preferences/SystemConfiguration/preferences.plist")
+            let netPlist = URL(fileURLWithPath: "/Library/Preferences/SystemConfiguration/preferences.plist")
             if let prefs = NSDictionary(contentsOf: netPlist),
                let svcs  = prefs["NetworkServices"] as? NSDictionary {
                 for (_, val) in svcs {
@@ -456,12 +431,10 @@ class AppUninstaller: ObservableObject {
                 }
             }
 
-            warnings.append(
-                "🔒 Privacy permissions (Camera/Mic/Full Disk Access) will be reset automatically via tccutil.")
+            warnings.append("🔒 Privacy permissions (Camera/Mic/Full Disk Access) will be reset automatically via tccutil.")
 
-            // SMLoginItems — use sfltool dumpbtm to check if THIS app is actually registered
-            // (avoids showing the advisory for every app since the BTM dir always exists)
-            let btmDump = self.runCmd("/usr/bin/sfltool", ["dumpbtm"], timeout: 5.0)
+            // SMLoginItems
+            let btmDump = await ProcessRunner.shared.run("/usr/bin/sfltool", ["dumpbtm"], timeout: 5.0).stdout
             let btmLower = btmDump.lowercased()
             let btmMatch = terms.contains(where: { btmLower.contains($0) }) ||
                            btmLower.contains(app.bundleID.lowercased())
@@ -472,9 +445,7 @@ class AppUninstaller: ObservableObject {
                     "Manual fix: sudo sfltool resetbtm (clears ALL apps — use with care, requires restart).")
             }
 
-
-            if let dock = NSDictionary(contentsOf: URL(fileURLWithPath:
-                "\(home)/Library/Preferences/com.apple.dock.plist")),
+            if let dock = NSDictionary(contentsOf: URL(fileURLWithPath: "\(home)/Library/Preferences/com.apple.dock.plist")),
                let pApps = dock["persistent-apps"] as? [[String: Any]] {
                 let inDock = pApps.contains { item in
                     if let td = item["tile-data"] as? [String: Any],
@@ -484,9 +455,7 @@ class AppUninstaller: ObservableObject {
                     }
                     return false
                 }
-                if inDock {
-                    warnings.append("🖥 Dock entry found — right-click the broken icon → Options → Remove from Dock after uninstall.")
-                }
+                if inDock { warnings.append("🖥 Dock entry found — right-click the broken icon → Options → Remove from Dock after uninstall.") }
             }
 
             warnings.append("🔔 Notification Center ghost entry will clear on next login.")
@@ -502,31 +471,75 @@ class AppUninstaller: ObservableObject {
             if adminCnt > 0       { msg += " · \(adminCnt) need admin" }
             if svcCnt > 0         { msg += " · \(svcCnt) services to unload" }
 
-            let sorted = found.sorted {
+            let finalMsg = msg 
+            let finalWarnings = warnings
+            let finalSorted = found.sorted {
                 if $0.isSIPProtected != $1.isSIPProtected { return !$0.isSIPProtected }
                 return $0.size > $1.size
             }
 
-            DispatchQueue.main.async {
-                self.relatedFiles        = sorted
+            await MainActor.run {
+                self.relatedFiles        = finalSorted
                 self.isFindingFiles      = false
-                self.statusMessage       = msg
+                self.statusMessage       = finalMsg
                 self.vendorUninstallerURL = vendorInstaller
-                self.advisoryWarnings    = warnings
-                self.runPreflightChecks(for: app)
+                self.advisoryWarnings    = finalWarnings
             }
+            
+            await self.runPreflightChecks(for: app)
         }
+    }
+
+    private func processCandidate(_ url: URL, source: String, app: AppBundle, terms: Set<String>, seen: inout Set<String>, warnings: inout [String], found: inout [RelatedFile]) async {
+        let path = url.path
+        let scanBase = app.realPath
+        let lastName = url.lastPathComponent.lowercased()
+
+        let (exists, isLink, nlink) = self.lstatInfo(url)
+        guard exists,
+              !seen.contains(path),
+              !path.hasPrefix(scanBase.path),
+              !self.sharedDirs.contains(path),
+              terms.contains(where: { lastName.contains($0) }) else { return }
+
+        // Needs await
+        if await self.isSharedByOtherPackages(url, appBundleID: app.bundleID) {
+            warnings.append("⚠️ Shared lib skipped (other apps use it): \(url.lastPathComponent)")
+            return
+        }
+
+        let isCloud = self.isICloudEvicted(url)
+        if isCloud {
+            warnings.append("☁️ iCloud evicted placeholder: \(url.lastPathComponent) — delete from iCloud.com or re-download first")
+        }
+
+        seen.insert(path)
+        
+        let fileItemSize = self.sizeOf(url: url)
+        if fileItemSize > 1_073_741_824 {
+            warnings.append("ℹ️ \(url.lastPathComponent) is over 1 GB — size computation was truncated.")
+        }
+        
+        found.append(RelatedFile(
+            url:             url,
+            size:            fileItemSize,
+            source:          source,
+            deletability:    self.classify(url),
+            isSymlink:       isLink,
+            hardLinkCount:   nlink,
+            isICloudEvicted: isCloud
+        ))
     }
 
     // MARK: — Uninstall
     func uninstall(app: AppBundle, completion: @escaping (Bool, String) -> Void) {
-        let appPath = app.realPath   // always operate on real, de-translocated path
+        let appPath = app.realPath
 
-        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             let fm = FileManager.default
 
-            let deletable     = self.relatedFiles.filter { $0.canBeDeleted }
+            let deletable     = await MainActor.run { self.relatedFiles.filter { $0.canBeDeleted } }
             var normalPaths   = deletable.filter { !$0.requiresAdmin }.map { $0.url.path }
             var adminPaths    = deletable.filter {  $0.requiresAdmin }.map { $0.url.path }
             let launchSvcIDs  = deletable.filter { $0.isLaunchService }
@@ -539,22 +552,20 @@ class AppUninstaller: ObservableObject {
                 ? adminPaths.insert(appPath.path, at: 0)
                 : normalPaths.insert(appPath.path, at: 0)
 
-            // UTI deregistration BEFORE deletion (lsregister can't process a missing .app)
             if !self.lsregisterPath.isEmpty {
-                _ = self.runCmd(self.lsregisterPath, ["-u", appPath.path])
+                await ProcessRunner.shared.run(self.lsregisterPath, ["-u", appPath.path])
             }
 
-            // Step 1: User-level files
             var failedNormal: [String] = []
             for path in normalPaths {
                 let url = URL(fileURLWithPath: path)
                 let (exists, isLink, _) = self.lstatInfo(url)
-                guard exists else { continue }   // Race condition guard
+                guard exists else { continue }
 
-                self.killHolders(path)
-                _ = self.runCmd("/usr/bin/chflags", ["-R", "nouchg", path])
-                _ = self.runCmd("/bin/chmod",       ["-RN",           path])
-                _ = self.runCmd("/usr/bin/xattr",   ["-cr",           path])
+                await self.killHolders(path)
+                await ProcessRunner.shared.run("/usr/bin/chflags", ["-R", "nouchg", path])
+                await ProcessRunner.shared.run("/bin/chmod",       ["-RN",           path])
+                await ProcessRunner.shared.run("/usr/bin/xattr",   ["-cr",           path])
                 do {
                     if isLink { try fm.removeItem(at: url) }
                     else      { try fm.removeItem(atPath: path) }
@@ -563,7 +574,6 @@ class AppUninstaller: ObservableObject {
                 }
             }
 
-            // Step 2: Admin bash script — 5 phases
             var lines = [
                 "#!/bin/bash",
                 "FAIL=''",
@@ -574,14 +584,15 @@ class AppUninstaller: ObservableObject {
             if !self.lsregisterPath.isEmpty {
                 lines.append("'\(self.lsregisterPath.esc)' -u '\(appPath.path.esc)' 2>/dev/null")
             }
+            
+            // Replaced pgrep -i with exact match kill (-x) or exact bundle pattern
             lines += [
                 "",
-                "# Phase 2: Kill all app processes — batch, single sleep",
-                "PIDS=$( { pgrep -f '\(app.bundleID.esc)'; pgrep -i '\(app.name.esc)'; } 2>/dev/null | sort -u)",
+                "# Phase 2: Kill all app processes",
+                "PIDS=$( { pgrep -x '\(app.name.esc)'; pgrep -f '\(app.bundleID.esc)'; } 2>/dev/null | sort -u)",
                 "[ -n \"$PIDS\" ] && kill -9 $PIDS 2>/dev/null && sleep 0.5",
                 "",
                 "# Phase 3: Unload LaunchAgents/Daemons BEFORE deleting their plists",
-                "# (deleting a loaded plist causes launchd to immediately re-spawn)"
             ]
             for svcID in launchSvcIDs {
                 let e = svcID.esc
@@ -596,11 +607,9 @@ class AppUninstaller: ObservableObject {
 
             lines += [
                 "",
-                "# Phase 4: Batch-kill all file holders — bash array so lsof gets",
-                "# all paths as separate argv entries (newline-separated fails silently)",
+                "# Phase 4: Batch-kill all file holders",
+                "KILL_PATHS=("
             ]
-            // Build bash array for lsof batch call
-            lines.append("KILL_PATHS=(")
             for path in adminPaths { lines.append("  '\(path.esc)'") }
             lines += [
                 ")",
@@ -615,14 +624,12 @@ class AppUninstaller: ObservableObject {
                 let rmCmd  = isLink ? "rm -f" : "rm -rf"
                 let isKext = path.hasSuffix(".kext")
                 var block  = [
-                    // Race condition guard — [ -e ] follows links, [ -L ] catches dangling ones
                     "if [ -e '\(e)' ] || [ -L '\(e)' ]; then",
                     "  chflags -R nouchg '\(e)' 2>/dev/null",
                     "  chmod -RN '\(e)' 2>/dev/null",
                     "  xattr -cr '\(e)' 2>/dev/null",
                 ]
                 if isKext {
-                    // kextunload actually executed — not just advisory
                     block += [
                         "  kextunload '\(e)' 2>/dev/null",
                         "  sleep 0.5",
@@ -647,38 +654,12 @@ class AppUninstaller: ObservableObject {
             }
             lines += ["", "printf 'FAILURES:%s\\n' \"$FAIL\""]
 
-            let tmp = "/tmp/macguard_\(Int(Date().timeIntervalSince1970)).sh"
-            try? lines.joined(separator: "\n")
-                .write(toFile: tmp, atomically: true, encoding: .utf8)
-            try? fm.setAttributes([.posixPermissions: NSNumber(value: 0o755)],
-                                  ofItemAtPath: tmp)
-
             var failedAdmin: [String] = []
             if !adminPaths.isEmpty {
-                // PRIVILEGE ESCALATION NOTE:
-                // NSAppleScript + 'do shell script ... with administrator privileges'
-                // works correctly for direct distribution (no App Sandbox).
-                //
-                // Migration is only needed if you:
-                //   • Add App Sandbox entitlement (blocks NSAppleScript entirely)
-                //   • Submit to the App Store (requires sandbox → same as above)
-                //   • Want a persistent root helper (avoids re-prompting per uninstall)
-                //
-                // When migrating: SMJobBless is DEPRECATED as of macOS 13.
-                // The modern replacement is SMAppService (ServiceManagement.framework).
-                // Note: SMAppService requires user approval in System Settings →
-                // General → Login Items before first use — worse UX than NSAppleScript's
-                // immediate password prompt for a one-shot uninstaller.
-                let esc   = tmp.esc
-                let ascpt = "do shell script \"bash '\(esc)'\" with administrator privileges"
-                var err: NSDictionary?
-                let res   = NSAppleScript(source: ascpt)?.executeAndReturnError(&err)
-                let out   = res?.stringValue ?? ""
-
-                if err != nil {
+                let res = await ProcessRunner.shared.runAdminScript(lines)
+                if !res.success {
                     failedAdmin = adminPaths.map { URL(fileURLWithPath: $0).lastPathComponent }
-                } else if let failLine = out.components(separatedBy: "\n")
-                    .first(where: { $0.hasPrefix("FAILURES:") }) {
+                } else if let failLine = res.output.components(separatedBy: "\n").first(where: { $0.hasPrefix("FAILURES:") }) {
                     failedAdmin = failLine
                         .replacingOccurrences(of: "FAILURES:", with: "")
                         .components(separatedBy: "|")
@@ -687,14 +668,13 @@ class AppUninstaller: ObservableObject {
                 }
             }
 
-            try? fm.removeItem(atPath: tmp)
-
             let allFailed = failedNormal + failedAdmin
             let appGone   = !fm.fileExists(atPath: appPath.path)
-            let sipCount  = self.relatedFiles.filter { $0.isSIPProtected }.count
-            let warnCount = self.advisoryWarnings.count
-
-            DispatchQueue.main.async {
+            
+            // Using MainActor to safely interact with relatedFiles array
+            await MainActor.run {
+                let sipCount  = self.relatedFiles.filter { $0.isSIPProtected }.count
+                let warnCount = self.advisoryWarnings.count
                 if appGone {
                     self.installedApps.removeAll { $0.id == app.id }
                     self.relatedFiles  = []
@@ -732,33 +712,14 @@ class AppUninstaller: ObservableObject {
     func hardLinkedCount() -> Int { relatedFiles.filter { $0.hardLinkCount > 1 }.count }
     func iCloudCount()     -> Int { relatedFiles.filter { $0.isICloudEvicted }.count }
 
-    private func killHolders(_ path: String) {
-        let pids = runCmd("/usr/bin/lsof", ["-t", path]).lines.compactMap { Int32($0) }
+    private func killHolders(_ path: String) async {
+        let pids = await ProcessRunner.shared.run("/usr/bin/lsof", ["-t", path]).stdout.lines.compactMap { Int32($0) }
         pids.forEach { Darwin.kill($0, SIGKILL) }
-        if !pids.isEmpty { Thread.sleep(forTimeInterval: 0.3) }
-    }
-
-    @discardableResult
-    private func runCmd(_ path: String, _ args: [String],
-                        timeout: TimeInterval = 15.0) -> String {
-        let task = Process()
-        task.executableURL  = URL(fileURLWithPath: path)
-        task.arguments      = args
-        let pipe            = Pipe()
-        task.standardOutput = pipe
-        task.standardError  = Pipe()
-        guard (try? task.run()) != nil else { return "" }
-        // Kill if it hangs — mdfind/pkgutil can block on network volumes
-        let killItem = DispatchWorkItem { task.terminate() }
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: killItem)
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        killItem.cancel()
-        task.waitUntilExit()
-        return String(data: data, encoding: .utf8) ?? ""
+        if !pids.isEmpty { try? await Task.sleep(nanoseconds: 300_000_000) }
     }
 
     // sizeOf WITHOUT .skipsHiddenFiles — .DS_Store and ._* files are real disk usage
-    private func sizeOf(url: URL) -> Int64 {
+    nonisolated private func sizeOf(url: URL) -> Int64 {
         let (_, isLink, _) = lstatInfo(url)
         if isLink {
             return (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size]
@@ -771,8 +732,10 @@ class AppUninstaller: ObservableObject {
             return (try? FileManager.default.attributesOfItem(atPath: url.path))?[.size]
                 as? Int64 ?? 0
         }
+        let limit: Int64 = 1_073_741_824 // 1GB bailout constraint for UI scanning speed
         for case let f as URL in enumerator {
             total += Int64((try? f.resourceValues(forKeys: [.fileSizeKey]))?.fileSize ?? 0)
+            if total > limit { return total }
         }
         return total
     }
@@ -784,6 +747,4 @@ private extension String {
             .map    { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
     }
-    // Correct shell single-quote escaping: ' → '\''
-    var esc: String { replacingOccurrences(of: "'", with: "'\\''") }
 }
