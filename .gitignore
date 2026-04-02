@@ -70,3 +70,11 @@ APIKeys.swift
 \#*\#
 .idea/
 *.iml
+node_modules/
+build/
+dist/
+.gradle/
+local.properties
+.next/
+.venv/
+*.log
